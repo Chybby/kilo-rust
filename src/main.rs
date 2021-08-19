@@ -2,17 +2,587 @@ use nix::sys::termios::{
     self, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios,
 };
 use std::cmp;
-use std::io::{self, Read, Write};
+use std::env;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use term_size;
+use std::time::Instant;
 
 const VERSION: &str = "0.0.1";
+const TAB_STOP: usize = 8;
+const MAX_STATUS_FILENAME_LENGTH: usize = 20;
 
-/*** macros ***/
+// Create a way to read from stdin without blocking.
+fn spawn_stdin_channel() -> Receiver<u8> {
+    let (tx, rx) = mpsc::channel::<u8>();
+    thread::spawn(move || loop {
+        let mut buf = [0];
+        io::stdin().read_exact(&mut buf).unwrap();
+        tx.send(buf[0]).unwrap();
+    });
+    rx
+}
 
-/*** terminal ***/
+fn get_window_size() -> Dimensions {
+    // Interfacing with ioctl in Rust is a bit of a pain.
+    let (width, height) = term_size::dimensions_stdin()
+        .expect("Failed to get terminal dimensions.");
+    Dimensions {
+        rows: height,
+        cols: width,
+    }
+}
+
+trait Control {
+    fn is_ctrl(&self, c: char) -> bool;
+}
+
+impl Control for char {
+    fn is_ctrl(&self, c: char) -> bool {
+        (c as u8) & 0b00011111 == *self as u8
+    }
+}
+
+struct Position {
+    x: usize,
+    y: usize,
+}
+
+struct Dimensions {
+    rows: usize,
+    cols: usize,
+}
+
+enum KeypressResult {
+    Continue,
+    Terminate,
+}
+
+#[derive(Debug)]
+enum Arrow {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug)]
+enum Key {
+    Char(char),
+    Ctrl(char),
+    Arrow(Arrow),
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Delete,
+    Esc,
+}
+
+struct Row {
+    chars: String,
+    render: String,
+}
+
+struct Editor {
+    screen_dimensions: Dimensions,
+    cursor_position: Position,
+    cursor_render_x: usize,
+    input: Receiver<u8>,
+    text_offset: Position,
+    rows: Vec<Row>,
+    filename: Option<String>,
+    status_message: String,
+    status_message_time: Instant,
+}
+
+impl Editor {
+    fn new() -> Editor {
+        let mut screen_dimensions = get_window_size();
+        screen_dimensions.rows -= 2; // Make room for status bar and message.
+
+        Editor {
+            screen_dimensions,
+            cursor_position: Position { x: 0, y: 0 },
+            cursor_render_x: 0,
+            input: spawn_stdin_channel(),
+            text_offset: Position { x: 0, y: 0 },
+            rows: Vec::new(),
+            filename: None,
+            status_message: "".to_string(),
+            status_message_time: Instant::now(),
+        }
+    }
+
+    // *** Row Operations ***
+
+    fn update_row(row: &mut Row) {
+        row.render = "".to_string();
+
+        for c in row.chars.chars() {
+            if c == '\t' {
+                let mut tab_size = TAB_STOP - (row.render.len() % TAB_STOP);
+                while tab_size > 0 {
+                    row.render.push(' ');
+                    tab_size -= 1;
+                }
+            } else {
+                row.render.push(c);
+            }
+        }
+    }
+
+    fn append_row(&mut self, chars: String) {
+        let mut row = Row {
+            chars,
+            render: "".to_string(),
+        };
+        Editor::update_row(&mut row);
+        self.rows.push(row);
+    }
+
+    fn get_render_index(&self) -> usize {
+        if self.cursor_position.y >= self.rows.len()
+            || self.cursor_position.x == 0
+        {
+            return 0;
+        }
+
+        let mut render_index = 0;
+
+        for c in self.get_current_row().unwrap().chars
+            [0..self.cursor_position.x]
+            .chars()
+        {
+            if c == '\t' {
+                render_index += (TAB_STOP - 1) - (render_index % TAB_STOP);
+            }
+            render_index += 1;
+        }
+        render_index
+    }
+
+    fn get_current_row(&self) -> Option<&Row> {
+        if self.cursor_position.y >= self.rows.len() {
+            None
+        } else {
+            Some(&self.rows[self.cursor_position.y])
+        }
+    }
+
+    // *** File I/O ***
+
+    fn open(&mut self, filename: &str) {
+        let f = File::open(filename).expect("Failed to open file");
+        let reader = BufReader::new(f);
+        let lines = reader.lines();
+
+        for l in lines {
+            self.append_row(l.expect("Error reading file"));
+        }
+
+        self.filename = Some(filename.to_string());
+    }
+
+    // *** Output ***
+
+    fn clear_screen(contents: &mut String) {
+        // Clear the whole screen.
+        contents.push_str("\x1b[2J");
+    }
+
+    fn clear_row(contents: &mut String) {
+        // Clear the current row from the cursor to the end.
+        contents.push_str("\x1b[K");
+    }
+
+    fn draw_cursor(contents: &mut String, cursor_position: &Position) {
+        // Move the displayed cursor to a certain position.
+        let s = format!(
+            "\x1b[{};{}H",
+            cursor_position.y + 1,
+            cursor_position.x + 1
+        );
+        contents.push_str(&s);
+    }
+
+    fn reset_cursor(contents: &mut String) {
+        // Move the cursor to the top left.
+        Editor::draw_cursor(contents, &Position { x: 0, y: 0 });
+    }
+
+    fn hide_cursor(contents: &mut String) {
+        // Make the cursor invisible.
+        contents.push_str("\x1b[?25l");
+    }
+
+    fn show_cursor(contents: &mut String) {
+        // Make the cursor visible.
+        contents.push_str("\x1b[?25h");
+    }
+
+    fn draw_rows(&self, contents: &mut String) {
+        for y in 0..self.screen_dimensions.rows {
+            let mut filled_line = false;
+            let file_row = y + self.text_offset.y;
+            if file_row >= self.rows.len() {
+                if self.rows.is_empty() && y == self.screen_dimensions.rows / 3
+                {
+                    let welcome_message =
+                        format!("Kilo editor -- version {}", VERSION);
+                    let message_length = cmp::min(
+                        welcome_message.len(),
+                        self.screen_dimensions.cols - 1,
+                    );
+
+                    let mut padding =
+                        (self.screen_dimensions.cols - message_length) / 2;
+                    if padding > 0 {
+                        contents.push('~');
+                        padding -= 1;
+                    }
+
+                    for _ in 0..padding {
+                        contents.push(' ');
+                    }
+
+                    contents.push_str(&welcome_message[..message_length]);
+                } else {
+                    contents.push('~');
+                }
+            } else {
+                let line_length = self.rows[file_row].render.len();
+                // Check if any of this line is visible.
+                if self.text_offset.x < line_length {
+                    let mut displayed_length = line_length - self.text_offset.x;
+                    // Cap the displayed length to the length of the screen.
+                    if displayed_length >= self.screen_dimensions.cols {
+                        displayed_length = self.screen_dimensions.cols;
+                        filled_line = true;
+                    }
+                    // Start displaying the line at the text offset.
+                    let start_index = self.text_offset.x;
+                    let end_index = start_index + displayed_length;
+                    contents.push_str(
+                        &self.rows[file_row].render[start_index..end_index],
+                    );
+                }
+            }
+            if !filled_line {
+                // TODO: maybe check in this function where the cursor is to
+                // decide whether to clear the rest of the row.
+                Editor::clear_row(contents);
+            }
+
+            contents.push_str("\r\n");
+        }
+    }
+
+    fn draw_status_bar(&self, contents: &mut String) {
+        contents.push_str("\x1b[7m"); // Invert colours.
+
+        let filename = match &self.filename {
+            Some(filename) => {
+                if filename.len() > MAX_STATUS_FILENAME_LENGTH {
+                    &filename[0..MAX_STATUS_FILENAME_LENGTH]
+                } else {
+                    filename
+                }
+            }
+            None => "[No name]",
+        };
+
+        let left_status = format!("{} - {} lines", filename, self.rows.len());
+
+        let right_status = format!(
+            "{}:{} ",
+            self.cursor_position.y + 1,
+            self.cursor_position.x + 1
+        );
+
+        let mut status: String = format!(
+            "{:width$}",
+            left_status,
+            width = self.screen_dimensions.cols - right_status.len()
+        )
+        .to_string();
+
+        status.push_str(&right_status);
+
+        if status.len() > self.screen_dimensions.cols {
+            contents.push_str(&status[0..self.screen_dimensions.cols]);
+        } else {
+            contents.push_str(&status);
+        }
+
+        contents.push_str("\x1b[m"); // Un-invert colours.
+        contents.push_str("\r\n");
+    }
+
+    fn draw_message_bar(&self, contents: &mut String) {
+        Editor::clear_row(contents);
+        let message = if self.status_message.len() > self.screen_dimensions.cols
+        {
+            &self.status_message[0..self.screen_dimensions.cols]
+        } else {
+            &self.status_message
+        };
+
+        if !message.is_empty()
+            && self.status_message_time.elapsed().as_secs() < 5
+        {
+            contents.push_str(message);
+        }
+    }
+
+    fn set_status_message(&mut self, message: &str) {
+        self.status_message = message.to_string();
+        self.status_message_time = Instant::now();
+    }
+
+    fn refresh_screen(&mut self) {
+        self.scroll();
+
+        let mut contents = String::new();
+
+        Editor::hide_cursor(&mut contents);
+        Editor::reset_cursor(&mut contents);
+
+        self.draw_rows(&mut contents);
+        self.draw_status_bar(&mut contents);
+        self.draw_message_bar(&mut contents);
+
+        let cursor_screen_position = Position {
+            x: self.cursor_render_x - self.text_offset.x,
+            y: self.cursor_position.y - self.text_offset.y,
+        };
+        Editor::draw_cursor(&mut contents, &cursor_screen_position);
+
+        Editor::show_cursor(&mut contents);
+
+        print!("{}", contents);
+        io::stdout().flush().unwrap();
+    }
+
+    fn reset_screen(&self) {
+        let mut contents = String::new();
+
+        Editor::clear_screen(&mut contents);
+        Editor::reset_cursor(&mut contents);
+
+        print!("{}", contents);
+        io::stdout().flush().unwrap();
+    }
+
+    // *** Input ***
+
+    fn read_key(&self) -> Key {
+        match self.input.recv() {
+            Ok(byte) => {
+                // Handling an escape sequence.
+                if byte == b'\x1b' {
+                    self.read_escape_sequence()
+                // Handling any other byte.
+                } else {
+                    let c = byte as char;
+                    if c.is_control() {
+                        Key::Ctrl((c as u8 | 0b01100000) as char)
+                    } else {
+                        Key::Char(c)
+                    }
+                }
+            }
+            Err(_) => panic!("Error reading from input channel"),
+        }
+    }
+
+    fn read_escape_sequence(&self) -> Key {
+        match self.input.try_recv() {
+            Ok(b'[') => match self.input.try_recv() {
+                Ok(b'A') => Key::Arrow(Arrow::Up),   // <esc>[A
+                Ok(b'B') => Key::Arrow(Arrow::Down), // <esc>[B
+                Ok(b'C') => Key::Arrow(Arrow::Right), // <esc>[C
+                Ok(b'D') => Key::Arrow(Arrow::Left), // <esc>[D
+                Ok(b'H') => Key::Home,               // <esc>[H
+                Ok(b'F') => Key::End,                // <esc>[F
+                Ok(n @ b'0'..=b'9') => match self.input.try_recv() {
+                    Ok(b'~') => match n {
+                        // Match on the number before the tilde.
+                        b'1' | b'7' => Key::Home, // <esc>[1~ or <esc>[7~
+                        b'4' | b'8' => Key::End,  // <esc>[4~ or <esc>[8~
+                        b'3' => Key::Delete,      // <esc>[3~
+                        b'5' => Key::PageUp,      // <esc>[5~
+                        b'6' => Key::PageDown,    // <esc>[6~
+                        _ => Key::Esc,
+                    },
+                    // Ignore all bytes after the esc.
+                    Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
+                    Err(TryRecvError::Disconnected) => {
+                        panic!("Input channel disconnected")
+                    }
+                },
+                // Ignore all bytes after the esc.
+                Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("Input channel disconnected")
+                }
+            },
+            Ok(b'O') => match self.input.try_recv() {
+                Ok(b'H') => Key::Home, // <esc>OH
+                Ok(b'F') => Key::End,  // <esc>OF
+                // Ignore all bytes after the esc.
+                Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("Input channel disconnected")
+                }
+            },
+            // Ignore the byte after the esc if there is one.
+            Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
+            Err(TryRecvError::Disconnected) => {
+                panic!("Input channel disconnected")
+            }
+        }
+    }
+    fn move_cursor(&mut self, arrow: Arrow) -> KeypressResult {
+        // TODO: moving down or up on a line with tabs doesn't work quite right.
+        // Could have the cursor position mean the render position then
+        // calculate the actual char position based on that. Eg. if the render
+        // position ends up in the middle of a tab, we would convert that to the
+        // tab in the char array then update the render position to the start or
+        // end of the tab.
+        match arrow {
+            Arrow::Up => {
+                if self.cursor_position.y > 0 {
+                    self.cursor_position.y -= 1
+                }
+            }
+            Arrow::Left => {
+                if self.cursor_position.x > 0 {
+                    self.cursor_position.x -= 1
+                } else if self.cursor_position.y > 0 {
+                    self.cursor_position.y -= 1;
+                    self.cursor_position.x =
+                        self.get_current_row().unwrap().chars.len();
+                }
+            }
+            Arrow::Down => {
+                if self.cursor_position.y < self.rows.len() {
+                    self.cursor_position.y += 1
+                }
+            }
+            Arrow::Right => {
+                if let Some(row) = self.get_current_row() {
+                    #[allow(clippy::comparison_chain)]
+                    if self.cursor_position.x < row.chars.len() {
+                        self.cursor_position.x += 1
+                    } else if self.cursor_position.x == row.chars.len() {
+                        self.cursor_position.y += 1;
+                        self.cursor_position.x = 0;
+                    }
+                }
+            }
+        };
+
+        let row_length = if let Some(row) = self.get_current_row() {
+            row.chars.len()
+        } else {
+            0
+        };
+
+        // Move the cursor to the end of the line if it is past the end.
+        if self.cursor_position.x > row_length {
+            self.cursor_position.x = row_length;
+        }
+
+        KeypressResult::Continue
+    }
+
+    fn scroll(&mut self) {
+        // Update which part of the file we're looking at based on the new
+        // position of the cursor.
+        self.cursor_render_x = self.get_render_index();
+
+        if self.cursor_position.y < self.text_offset.y {
+            self.text_offset.y = self.cursor_position.y;
+        }
+
+        if self.cursor_position.y
+            >= self.text_offset.y + self.screen_dimensions.rows
+        {
+            self.text_offset.y =
+                self.cursor_position.y - self.screen_dimensions.rows + 1;
+        }
+
+        if self.cursor_render_x < self.text_offset.x {
+            self.text_offset.x = self.cursor_render_x;
+        }
+
+        if self.cursor_render_x
+            >= self.text_offset.x + self.screen_dimensions.cols
+        {
+            self.text_offset.x =
+                self.cursor_render_x - self.screen_dimensions.cols + 1;
+        }
+    }
+
+    fn process_keypress(&mut self) -> KeypressResult {
+        let key = self.read_key();
+
+        match key {
+            Key::Ctrl('q') => KeypressResult::Terminate,
+            Key::Arrow(arrow) => self.move_cursor(arrow),
+            key @ Key::PageUp | key @ Key::PageDown => {
+                match key {
+                    Key::PageUp => self.cursor_position.y = self.text_offset.y,
+                    Key::PageDown => {
+                        self.cursor_position.y = self.text_offset.y
+                            + self.screen_dimensions.rows
+                            - 1;
+                        if self.cursor_position.y > self.rows.len() {
+                            self.cursor_position.y = self.rows.len();
+                        }
+                    }
+                    _ => {}
+                }
+
+                for _ in 0..self.screen_dimensions.rows - 1 {
+                    self.move_cursor(if let Key::PageUp = key {
+                        Arrow::Up
+                    } else {
+                        Arrow::Down
+                    });
+                }
+                KeypressResult::Continue
+            }
+            Key::Home => {
+                self.cursor_position.x = 0;
+                KeypressResult::Continue
+            }
+            Key::End => {
+                if let Some(row) = self.get_current_row() {
+                    self.cursor_position.x = row.chars.len();
+                }
+                KeypressResult::Continue
+            }
+            _ => KeypressResult::Continue,
+        }
+    }
+
+    fn render_loop(&mut self) {
+        loop {
+            self.refresh_screen();
+            if let KeypressResult::Terminate = self.process_keypress() {
+                break;
+            }
+        }
+
+        self.reset_screen();
+    }
+}
+
+/*** init ***/
 
 fn enable_raw_mode() -> Termios {
     let stdin_raw_fd = io::stdin().as_raw_fd();
@@ -34,7 +604,7 @@ fn enable_raw_mode() -> Termios {
     // Rust always blocks when reading from stdin.
     // termios.c_cc[VMIN] = 0;
     // termios.c_cc[VTIME] = 1;
-    termios::tcsetattr(stdin_raw_fd, SetArg::TCSAFLUSH, &mut termios)
+    termios::tcsetattr(stdin_raw_fd, SetArg::TCSAFLUSH, &termios)
         .expect("Error in tcsetattr");
 
     orig_termios
@@ -46,345 +616,31 @@ fn disable_raw_mode(orig_termios: &mut Termios) {
         .expect("Error in tcsetattr");
 }
 
-struct RawModeDisabler {
+struct TerminalRestorer {
     orig_termios: Termios,
 }
 
-impl Drop for RawModeDisabler {
+impl Drop for TerminalRestorer {
     fn drop(&mut self) {
         disable_raw_mode(&mut self.orig_termios);
     }
 }
 
-// Create a way to read from stdin without blocking.
-fn spawn_stdin_channel() -> Receiver<u8> {
-    let (tx, rx) = mpsc::channel::<u8>();
-    thread::spawn(move || loop {
-        let mut buf = [0];
-        io::stdin().read(&mut buf).unwrap();
-        tx.send(buf[0]).unwrap();
-    });
-    rx
-}
-
-enum Arrow {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-enum Key {
-    Char(char),
-    Ctrl(char),
-    Arrow(Arrow),
-    PageUp,
-    PageDown,
-    Home,
-    End,
-    Delete,
-    Esc,
-}
-
-fn editor_read_key(input: &Receiver<u8>) -> Key {
-    // TODO: this is a bit of a mess.
-    match input.recv() {
-        Ok(byte) => {
-            // Handling an escape sequence.
-            if byte == b'\x1b' {
-                // Try to read the rest of the escape sequence.
-                match input.try_recv() {
-                    Ok(b'[') => {
-                        match input.try_recv() {
-                            Ok(b'A') => Key::Arrow(Arrow::Up),
-                            Ok(b'B') => Key::Arrow(Arrow::Down),
-                            Ok(b'C') => Key::Arrow(Arrow::Right),
-                            Ok(b'D') => Key::Arrow(Arrow::Left),
-                            Ok(b'H') => Key::Home,
-                            Ok(b'F') => Key::End,
-                            Ok(n @ b'0'..=b'9') => match input.try_recv() {
-                                Ok(b'~') => match n {
-                                    b'1' | b'7' => Key::Home,
-                                    b'4' | b'8' => Key::End,
-                                    b'3' => Key::Delete,
-                                    b'5' => Key::PageUp,
-                                    b'6' => Key::PageDown,
-                                    _ => Key::Esc,
-                                },
-                                // Ignore all three bytes after the esc.
-                                Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
-                                Err(TryRecvError::Disconnected) => {
-                                    panic!("Input channel disconnected")
-                                }
-                            },
-                            Ok(b'O') => match input.try_recv() {
-                                Ok(b'H') => Key::Home,
-                                Ok(b'F') => Key::End,
-                                // Ignore all three bytes after the esc.
-                                Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
-                                Err(TryRecvError::Disconnected) => {
-                                    panic!("Input channel disconnected")
-                                }
-                            },
-                            // Ignore both bytes after the esc.
-                            Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
-                            Err(TryRecvError::Disconnected) => {
-                                panic!("Input channel disconnected")
-                            }
-                        }
-                    }
-                    // Ignore the byte after the esc.
-                    Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
-                    Err(TryRecvError::Disconnected) => {
-                        panic!("Input channel disconnected")
-                    }
-                }
-            // Handling any other byte.
-            } else {
-                let c = byte as char;
-                if c.is_control() {
-                    Key::Ctrl((c as u8 | 0b01100000) as char)
-                } else {
-                    Key::Char(c)
-                }
-            }
-        }
-        Err(_) => panic!("Error reading from input channel"),
-    }
-}
-
-fn get_window_size() -> Dimensions {
-    // Interfacing with ioctl in Rust is a bit of a pain.
-    let (width, height) = term_size::dimensions_stdin()
-        .expect("Failed to get terminal dimensions.");
-    Dimensions {
-        rows: height,
-        cols: width,
-    }
-}
-
-/*** output ***/
-
-// TODO: abstract away all drawing to some struct.
-fn editor_clear_screen(contents: &mut String) {
-    // Clear the whole screen.
-    contents.push_str("\x1b[2J");
-}
-
-fn editor_clear_row(contents: &mut String) {
-    // Clear the current row from the cursor to the end.
-    contents.push_str("\x1b[K");
-}
-
-fn editor_reset_cursor(contents: &mut String) {
-    // Move the cursor to the top left.
-    editor_draw_cursor(contents, &Position { x: 0, y: 0 });
-}
-
-fn editor_draw_cursor(contents: &mut String, cursor_position: &Position) {
-    // Move the displayed cursor to a certain position.
-    let s =
-        format!("\x1b[{};{}H", cursor_position.y + 1, cursor_position.x + 1);
-    contents.push_str(&s);
-}
-
-fn editor_hide_cursor(contents: &mut String) {
-    // Make the cursor invisible.
-    contents.push_str("\x1b[?25l");
-}
-
-fn editor_show_cursor(contents: &mut String) {
-    // Make the cursor visible.
-    contents.push_str("\x1b[?25h");
-}
-
-fn editor_draw_rows(editor_state: &EditorState, contents: &mut String) {
-    for y in 0..editor_state.screen_dimensions.rows {
-        if y == editor_state.screen_dimensions.rows / 3 {
-            let welcome_message = format!("Kilo editor -- version {}", VERSION);
-            let message_length = cmp::min(
-                welcome_message.len(),
-                editor_state.screen_dimensions.cols - 1,
-            );
-
-            let mut padding =
-                (editor_state.screen_dimensions.cols - message_length) / 2;
-            if padding > 0 {
-                contents.push_str("~");
-                padding -= 1;
-            }
-
-            for _ in 0..padding {
-                contents.push_str(" ");
-            }
-
-            contents.push_str(&welcome_message[..message_length]);
-        } else {
-            contents.push_str("~");
-        }
-        editor_clear_row(contents);
-
-        // Add a newline to all but the last line.
-        if y < editor_state.screen_dimensions.rows - 1 {
-            contents.push_str("\r\n");
-        }
-    }
-}
-
-fn editor_reset_screen() {
-    let mut contents = String::new();
-
-    editor_clear_screen(&mut contents);
-    editor_reset_cursor(&mut contents);
-
-    print!("{}", contents);
-    io::stdout().flush().unwrap();
-}
-
-fn editor_refresh_screen(editor_state: &EditorState) {
-    let mut contents = String::new();
-
-    editor_hide_cursor(&mut contents);
-    editor_reset_cursor(&mut contents);
-
-    editor_draw_rows(editor_state, &mut contents);
-
-    editor_draw_cursor(&mut contents, &editor_state.cursor_position);
-
-    editor_show_cursor(&mut contents);
-
-    print!("{}", contents);
-    io::stdout().flush().unwrap();
-}
-
-/*** input ***/
-
-enum KeypressResult {
-    Continue,
-    Terminate,
-}
-
-fn editor_move_cursor(
-    editor_state: &mut EditorState,
-    arrow: Arrow,
-) -> KeypressResult {
-    match arrow {
-        Arrow::Up => {
-            if editor_state.cursor_position.y > 0 {
-                editor_state.cursor_position.y -= 1
-            }
-        }
-        Arrow::Left => {
-            if editor_state.cursor_position.x > 0 {
-                editor_state.cursor_position.x -= 1
-            }
-        }
-        Arrow::Down => {
-            if editor_state.cursor_position.y
-                < editor_state.screen_dimensions.rows - 1
-            {
-                editor_state.cursor_position.y += 1
-            }
-        }
-        Arrow::Right => {
-            if editor_state.cursor_position.x
-                < editor_state.screen_dimensions.cols - 1
-            {
-                editor_state.cursor_position.x += 1
-            }
-        }
-    };
-    KeypressResult::Continue
-}
-
-fn editor_process_keypress(editor_state: &mut EditorState) -> KeypressResult {
-    let key = editor_read_key(&editor_state.input);
-
-    match key {
-        Key::Ctrl('q') => KeypressResult::Terminate,
-        Key::Arrow(arrow) => editor_move_cursor(editor_state, arrow),
-        key @ Key::PageUp | key @ Key::PageDown => {
-            for _ in 0..editor_state.screen_dimensions.rows {
-                editor_move_cursor(
-                    editor_state,
-                    if let Key::PageUp = key {
-                        Arrow::Up
-                    } else {
-                        Arrow::Down
-                    },
-                );
-            }
-            KeypressResult::Continue
-        }
-        Key::Home => {
-            editor_state.cursor_position.x = 0;
-            KeypressResult::Continue
-        }
-        Key::End => {
-            editor_state.cursor_position.x =
-                editor_state.screen_dimensions.cols - 1;
-            KeypressResult::Continue
-        }
-        _ => KeypressResult::Continue,
-    }
-}
-
-trait Control {
-    fn is_ctrl(self, c: char) -> bool;
-}
-
-impl Control for char {
-    fn is_ctrl(self, c: char) -> bool {
-        return (c as u8) & 0b00011111 == self as u8;
-    }
-}
-
-/*** init ***/
-
-struct Position {
-    x: usize,
-    y: usize,
-}
-
-struct Dimensions {
-    rows: usize,
-    cols: usize,
-}
-
-struct EditorState {
-    screen_dimensions: Dimensions,
-    cursor_position: Position,
-    input: Receiver<u8>,
-}
-
-impl EditorState {
-    fn new() -> EditorState {
-        let screen_dimensions = get_window_size();
-
-        EditorState {
-            screen_dimensions,
-            cursor_position: Position { x: 0, y: 0 },
-            input: spawn_stdin_channel(),
-        }
-    }
-}
-
 fn main() {
-    // Enabling raw mode.
+    // Enabling raw mode and saving current terminal options.
     let orig_termios = enable_raw_mode();
-    // Disable raw mode when this struct is dropped.
-    let _raw_mode_disabler = RawModeDisabler { orig_termios };
+    // Restore the original terminal options when this struct is dropped.
+    // This ensures the original options are restored even if we panic.
+    let _terminal_restorer = TerminalRestorer { orig_termios };
 
-    let mut editor_state = EditorState::new();
+    let mut editor = Editor::new();
 
-    loop {
-        editor_refresh_screen(&editor_state);
-        if let KeypressResult::Terminate =
-            editor_process_keypress(&mut editor_state)
-        {
-            break;
-        }
+    let mut args = env::args();
+    if args.len() >= 2 {
+        editor.open(&args.nth(1).unwrap());
     }
 
-    editor_reset_screen();
+    editor.set_status_message("HELP: Ctrl-Q = quit");
+
+    editor.render_loop();
 }
