@@ -164,6 +164,29 @@ impl Editor {
         render_index
     }
 
+    fn get_char_index(&self) -> usize {
+        if self.cursor_position.y >= self.rows.len()
+            || self.cursor_render_x == 0
+        {
+            return 0;
+        }
+
+        let mut char_index = 0;
+        let mut render_index = 0;
+
+        for c in self.get_current_row().unwrap().chars.chars(){
+            if c == '\t' {
+                render_index += (TAB_STOP - 1) - (render_index % TAB_STOP);
+            }
+            render_index += 1;
+            char_index += 1;
+            if render_index >= self.cursor_render_x {
+                return char_index;
+            }
+        }
+        char_index
+    }
+
     fn get_current_row(&self) -> Option<&Row> {
         if self.cursor_position.y >= self.rows.len() {
             None
@@ -446,16 +469,11 @@ impl Editor {
         }
     }
     fn move_cursor(&mut self, arrow: Arrow) -> KeypressResult {
-        // TODO: moving down or up on a line with tabs doesn't work quite right.
-        // Could have the cursor position mean the render position then
-        // calculate the actual char position based on that. Eg. if the render
-        // position ends up in the middle of a tab, we would convert that to the
-        // tab in the char array then update the render position to the start or
-        // end of the tab.
         match arrow {
             Arrow::Up => {
                 if self.cursor_position.y > 0 {
-                    self.cursor_position.y -= 1
+                    self.cursor_position.y -= 1;
+                    self.cursor_position.x = self.get_char_index();
                 }
             }
             Arrow::Left => {
@@ -469,7 +487,8 @@ impl Editor {
             }
             Arrow::Down => {
                 if self.cursor_position.y < self.rows.len() {
-                    self.cursor_position.y += 1
+                    self.cursor_position.y += 1;
+                    self.cursor_position.x = self.get_char_index();
                 }
             }
             Arrow::Right => {
