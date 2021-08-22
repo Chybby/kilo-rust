@@ -15,6 +15,7 @@ const VERSION: &str = "0.0.1";
 const TAB_STOP: usize = 8;
 const MAX_STATUS_FILENAME_LENGTH: usize = 20;
 const QUIT_TIMES: u8 = 3;
+const NON_PRINTING_CHARACTERS: bool = false;
 
 // Create a way to read from stdin without blocking.
 fn spawn_stdin_channel() -> Receiver<u8> {
@@ -89,12 +90,27 @@ impl Row {
             if c == '\t' {
                 let mut tab_size = TAB_STOP - (self.render.len() % TAB_STOP);
                 while tab_size > 0 {
-                    self.render.push(' ');
+                    if !NON_PRINTING_CHARACTERS {
+                        self.render.push(' ');
+                    } else if tab_size == 1 {
+                        self.render.push('→');
+                    } else {
+                        self.render.push('—');
+                    }
                     tab_size -= 1;
+                }
+            } else if c == ' ' {
+                if NON_PRINTING_CHARACTERS {
+                    self.render.push('·');
+                } else {
+                    self.render.push(' ');
                 }
             } else {
                 self.render.push(c);
             }
+        }
+        if NON_PRINTING_CHARACTERS {
+            self.render.push('↵');
         }
     }
 
