@@ -1,6 +1,7 @@
 use nix::sys::termios::{
     self, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios,
 };
+use regex::Regex;
 use std::cmp;
 use std::env;
 use std::fs::File;
@@ -36,6 +37,7 @@ fn get_window_size() -> Dimensions {
     }
 }
 
+#[derive(Copy, Clone)]
 struct Position {
     x: usize,
     y: usize,
@@ -131,6 +133,8 @@ struct Editor {
     status_message_time: Instant,
     dirty: bool,
     quit_times: u8,
+    matches: Vec<usize>,
+    match_index: usize,
 }
 
 impl Editor {
@@ -150,6 +154,8 @@ impl Editor {
             status_message_time: Instant::now(),
             dirty: false,
             quit_times: QUIT_TIMES,
+            matches: Vec::new(),
+            match_index: 0,
         }
     }
 
@@ -313,7 +319,10 @@ impl Editor {
 
     fn save(&mut self) {
         if self.filename.is_none() {
-            self.filename = self.prompt("Save as: {} (ESC to cancel)");
+            self.filename = self
+                .prompt("Save as: {} (ESC to cancel)", |_, _, _| {
+                    "".to_string()
+                });
             if self.filename.is_none() {
                 self.set_status_message("Save aborted");
                 return;
@@ -341,6 +350,81 @@ impl Editor {
             Err(error) => {
                 self.set_status_message(&format!("Save failed: {:?}", error))
             }
+        }
+    }
+
+    // *** Find ***
+
+    fn find_callback(&mut self, query: &str, key: Key) -> String {
+        if query.is_empty() {
+            return "".to_string();
+        }
+
+        let regex: Regex;
+        match Regex::new(query) {
+            Ok(re) => regex = re,
+            _ => return ": Invalid regex".to_string(),
+        }
+
+        match key {
+            Key::Esc | Key::Enter => {
+                self.matches.clear();
+                self.match_index = 0;
+                return "".to_string();
+            }
+            Key::Arrow(Arrow::Left) | Key::Arrow(Arrow::Up) => {
+                self.match_index = if self.match_index == 0 {
+                    self.matches.len() - 1
+                } else {
+                    self.match_index - 1
+                };
+            }
+            Key::Arrow(Arrow::Right) | Key::Arrow(Arrow::Down) => {
+                self.match_index = if self.match_index == self.matches.len() - 1
+                {
+                    0
+                } else {
+                    self.match_index + 1
+                };
+            }
+            _ => {
+                self.matches.clear();
+                self.match_index = 0;
+                for (i, row) in self.rows.iter().enumerate() {
+                    if regex.is_match(&row.chars) {
+                        self.matches.push(i);
+                    }
+                }
+            }
+        }
+
+        if self.matches.is_empty() {
+            return ": No results".to_string();
+        }
+
+        let row = &self.rows[self.matches[self.match_index]];
+        let row_index = regex.find(&row.chars).unwrap();
+        self.cursor_position.y = self.matches[self.match_index];
+        self.text_offset.y = self.matches[self.match_index];
+        self.cursor_position.x = row_index.start();
+
+        format!(
+            ": {} out of {} results",
+            self.match_index + 1,
+            self.matches.len()
+        )
+    }
+
+    fn find(&mut self) {
+        let saved_cursor_position = self.cursor_position;
+        let saved_text_offset = self.text_offset;
+
+        if self
+            .prompt("Search: {} (Use ESC/Arrows/Enter)", Editor::find_callback)
+            .is_none()
+        {
+            self.cursor_position = saved_cursor_position;
+            self.text_offset = saved_text_offset;
         }
     }
 
@@ -429,8 +513,6 @@ impl Editor {
                 }
             }
             if !filled_line {
-                // TODO: maybe check in this function where the cursor is to
-                // decide whether to clear the rest of the row.
                 Editor::clear_row(contents);
             }
 
@@ -541,10 +623,18 @@ impl Editor {
 
     // *** Input ***
 
-    fn prompt(&mut self, prompt: &str) -> Option<String> {
+    fn prompt<F>(&mut self, prompt: &str, callback: F) -> Option<String>
+    where
+        F: Fn(&mut Editor, &str, Key) -> String,
+    {
         let mut input = "".to_string();
+        let mut message = "".to_string();
         loop {
-            self.set_status_message(&prompt.replace("{}", &input));
+            self.set_status_message(&format!(
+                "{} {}",
+                prompt.replace("{}", &input),
+                &message
+            ));
             self.refresh_screen();
 
             let key = self.read_key();
@@ -554,11 +644,13 @@ impl Editor {
                 }
                 Key::Esc => {
                     self.set_status_message("");
+                    callback(self, &input, key);
                     return None;
                 }
                 Key::Enter => {
                     if !input.is_empty() {
                         self.set_status_message("");
+                        callback(self, &input, key);
                         return Some(input);
                     }
                 }
@@ -567,6 +659,7 @@ impl Editor {
                 }
                 _ => {}
             }
+            message = callback(self, &input, key);
         }
     }
 
@@ -741,6 +834,10 @@ impl Editor {
                 self.save();
                 KeypressResult::Continue
             }
+            Key::Ctrl('r') => {
+                self.find();
+                KeypressResult::Continue
+            }
             Key::Arrow(arrow) => self.move_cursor(arrow),
             key @ Key::PageUp | key @ Key::PageDown => {
                 match key {
@@ -872,7 +969,9 @@ fn main() {
         editor.open(&args.nth(1).unwrap());
     }
 
-    editor.set_status_message("HELP: Ctrl-S = Save | Ctrl-Q = quit");
+    editor.set_status_message(
+        "HELP: Ctrl-S = Save | Ctrl-F = Find | Ctrl-Q = Quit",
+    );
 
     editor.render_loop();
 }
