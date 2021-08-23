@@ -10,20 +10,32 @@ use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Instant;
+use unicode_width::UnicodeWidthChar;
 
 const VERSION: &str = "0.0.1";
+
+// TODO: get config from config file.
 const TAB_STOP: usize = 8;
 const MAX_STATUS_FILENAME_LENGTH: usize = 20;
 const QUIT_TIMES: u8 = 3;
 const NON_PRINTING_CHARACTERS: bool = false;
 
-// Create a way to read from stdin without blocking.
-fn spawn_stdin_channel() -> Receiver<u8> {
-    let (tx, rx) = mpsc::channel::<u8>();
+// Create a way to read chars from stdin without blocking.
+fn spawn_stdin_channel() -> Receiver<char> {
+    let (tx, rx) = mpsc::channel::<char>();
     thread::spawn(move || loop {
-        let mut buf = [0];
-        io::stdin().read_exact(&mut buf).unwrap();
-        tx.send(buf[0]).unwrap();
+        let mut byte: [u8; 1] = [0];
+        let mut buf: [u8; 4] = [0; 4];
+        let mut i = 0;
+        loop {
+            io::stdin().read_exact(&mut byte).unwrap();
+            buf[i] = byte[0];
+            if let Ok(s) = std::str::from_utf8(&buf[0..i + 1]) {
+                tx.send(s.chars().next().unwrap()).unwrap();
+                break;
+            }
+            i += 1;
+        }
     });
     rx
 }
@@ -84,11 +96,13 @@ struct Row {
 
 impl Row {
     fn update(&mut self) {
-        self.render = "".to_string();
+        self.render = String::new();
+
+        let mut render_length = 0;
 
         for c in self.chars.chars() {
             if c == '\t' {
-                let mut tab_size = TAB_STOP - (self.render.len() % TAB_STOP);
+                let mut tab_size = TAB_STOP - (render_length % TAB_STOP);
                 while tab_size > 0 {
                     if !NON_PRINTING_CHARACTERS {
                         self.render.push(' ');
@@ -97,6 +111,7 @@ impl Row {
                     } else {
                         self.render.push('—');
                     }
+                    render_length += 1;
                     tab_size -= 1;
                 }
             } else if c == ' ' {
@@ -105,8 +120,14 @@ impl Row {
                 } else {
                     self.render.push(' ');
                 }
+                render_length += 1;
             } else {
                 self.render.push(c);
+                render_length += 1;
+                for _ in 0..UnicodeWidthChar::width(c).unwrap_or(1) - 1 {
+                    self.render.push('\x00');
+                    render_length += 1;
+                }
             }
         }
         if NON_PRINTING_CHARACTERS {
@@ -115,11 +136,26 @@ impl Row {
     }
 
     fn insert_char(&mut self, mut index: usize, c: char) {
-        if index > self.chars.len() {
-            index = self.chars.len();
+        let count = self.chars.chars().count();
+        if index > count {
+            index = count;
         }
 
-        self.chars.insert(index, c);
+        let mut new_chars = String::new();
+
+        if index == count {
+            self.chars.push(c);
+        } else {
+            for (i, char) in self.chars.chars().enumerate() {
+                if i == index {
+                    new_chars.push(c);
+                }
+                new_chars.push(char);
+            }
+
+            self.chars = new_chars;
+        }
+
         self.update();
     }
 
@@ -129,10 +165,20 @@ impl Row {
     }
 
     fn delete_char(&mut self, index: usize) {
-        if index >= self.chars.len() {
+        let count = self.chars.chars().count();
+        if index >= count {
             return;
         }
-        self.chars.remove(index);
+
+        let mut new_chars = String::new();
+
+        for (i, char) in self.chars.chars().enumerate() {
+            if i != index {
+                new_chars.push(char);
+            }
+        }
+
+        self.chars = new_chars;
         self.update();
     }
 }
@@ -141,7 +187,7 @@ struct Editor {
     screen_dimensions: Dimensions,
     cursor_position: Position,
     cursor_render_x: usize,
-    input: Receiver<u8>,
+    input: Receiver<char>,
     text_offset: Position,
     rows: Vec<Row>,
     filename: Option<String>,
@@ -166,7 +212,7 @@ impl Editor {
             text_offset: Position { x: 0, y: 0 },
             rows: Vec::new(),
             filename: None,
-            status_message: "".to_string(),
+            status_message: String::new(),
             status_message_time: Instant::now(),
             dirty: false,
             quit_times: QUIT_TIMES,
@@ -177,14 +223,14 @@ impl Editor {
 
     // *** Row Operations ***
 
-    fn insert_row(&mut self, index: usize, chars: String) {
+    fn insert_row(&mut self, index: usize, chars: &str) {
         if index > self.rows.len() {
             return;
         }
 
         let mut row = Row {
-            chars,
-            render: "".to_string(),
+            chars: chars.to_string(),
+            render: String::new(),
         };
         row.update();
         self.rows.insert(index, row);
@@ -200,14 +246,18 @@ impl Editor {
 
         let mut render_index = 0;
 
-        for c in self.get_current_row().unwrap().chars
-            [0..self.cursor_position.x]
+        for c in self
+            .get_current_row()
+            .unwrap()
+            .chars
             .chars()
+            .take(self.cursor_position.x)
         {
             if c == '\t' {
                 render_index += (TAB_STOP - 1) - (render_index % TAB_STOP);
+            } else {
+                render_index += UnicodeWidthChar::width(c).unwrap_or(0);
             }
-            render_index += 1;
         }
         render_index
     }
@@ -247,7 +297,7 @@ impl Editor {
 
     fn insert_char(&mut self, c: char) {
         if self.cursor_position.y == self.rows.len() {
-            self.insert_row(self.rows.len(), "".to_string());
+            self.insert_row(self.rows.len(), "");
         }
         self.rows[self.cursor_position.y]
             .insert_char(self.cursor_position.x, c);
@@ -270,7 +320,7 @@ impl Editor {
             self.dirty = true;
         } else {
             self.cursor_position.x =
-                self.rows[self.cursor_position.y - 1].chars.len();
+                self.rows[self.cursor_position.y - 1].chars.chars().count();
             let (start, end) = self.rows.split_at_mut(self.cursor_position.y);
             let previous_row = start.last_mut().unwrap();
             let current_row = &end[0];
@@ -282,14 +332,14 @@ impl Editor {
 
     fn insert_newline(&mut self) {
         if self.cursor_position.x == 0 {
-            self.insert_row(self.cursor_position.y, "".to_string());
+            self.insert_row(self.cursor_position.y, "");
         } else {
             let new_row_contents = self.rows[self.cursor_position.y]
                 .chars
                 .split_at(self.cursor_position.x)
                 .1
                 .to_string();
-            self.insert_row(self.cursor_position.y + 1, new_row_contents);
+            self.insert_row(self.cursor_position.y + 1, &new_row_contents);
             self.rows[self.cursor_position.y]
                 .chars
                 .truncate(self.cursor_position.x);
@@ -316,7 +366,7 @@ impl Editor {
         let lines = reader.lines();
 
         for l in lines {
-            self.insert_row(self.rows.len(), l.expect("Error reading file"));
+            self.insert_row(self.rows.len(), &l.expect("Error reading file"));
         }
 
         self.filename = Some(filename.to_string());
@@ -324,7 +374,7 @@ impl Editor {
     }
 
     fn rows_to_string(&self) -> String {
-        let mut file_contents = "".to_string();
+        let mut file_contents = String::new();
 
         for row in &self.rows {
             file_contents.push_str(&row.chars);
@@ -336,9 +386,7 @@ impl Editor {
     fn save(&mut self) {
         if self.filename.is_none() {
             self.filename = self
-                .prompt("Save as: {} (ESC to cancel)", |_, _, _| {
-                    "".to_string()
-                });
+                .prompt("Save as: {} (ESC to cancel)", |_, _, _| String::new());
             if self.filename.is_none() {
                 self.set_status_message("Save aborted");
                 return;
@@ -357,10 +405,8 @@ impl Editor {
                         self.dirty = false;
                     }
                     // An error here means the file contents are lost. Oh well.
-                    Err(error) => self.set_status_message(&format!(
-                        "Save failed: {:?}",
-                        error
-                    )),
+                    Err(error) => self
+                        .set_status_message(&format!("Save failed: {}", error)),
                 }
             }
             Err(error) => {
@@ -373,7 +419,7 @@ impl Editor {
 
     fn find_callback(&mut self, query: &str, key: Key) -> String {
         if query.is_empty() {
-            return "".to_string();
+            return String::new();
         }
 
         let regex: Regex;
@@ -386,7 +432,7 @@ impl Editor {
             Key::Esc | Key::Enter => {
                 self.matches.clear();
                 self.match_index = 0;
-                return "".to_string();
+                return String::new();
             }
             Key::Arrow(Arrow::Left) | Key::Arrow(Arrow::Up) => {
                 self.match_index = if self.match_index == 0 {
@@ -422,7 +468,12 @@ impl Editor {
         let row_index = regex.find(&row.chars).unwrap();
         self.cursor_position.y = self.matches[self.match_index];
         self.text_offset.y = self.matches[self.match_index];
-        self.cursor_position.x = row_index.start();
+        for (i, (byte_offset, _)) in row.chars.char_indices().enumerate() {
+            if byte_offset >= row_index.start() {
+                self.cursor_position.x = i;
+                break;
+            }
+        }
 
         format!(
             ": {} out of {} results",
@@ -498,6 +549,7 @@ impl Editor {
                     let mut padding =
                         (self.screen_dimensions.cols - message_length) / 2;
                     if padding > 0 {
+                        // TODO: colour.
                         contents.push('~');
                         padding -= 1;
                     }
@@ -508,10 +560,11 @@ impl Editor {
 
                     contents.push_str(&welcome_message[..message_length]);
                 } else {
+                    // TODO: colour.
                     contents.push('~');
                 }
             } else {
-                let line_length = self.rows[file_row].render.len();
+                let line_length = self.rows[file_row].render.chars().count();
                 // Check if any of this line is visible.
                 if self.text_offset.x < line_length {
                     let mut displayed_length = line_length - self.text_offset.x;
@@ -522,10 +575,28 @@ impl Editor {
                     }
                     // Start displaying the line at the text offset.
                     let start_index = self.text_offset.x;
-                    let end_index = start_index + displayed_length;
-                    contents.push_str(
-                        &self.rows[file_row].render[start_index..end_index],
-                    );
+                    let row = self.rows[file_row]
+                        .render
+                        .chars()
+                        .skip(start_index)
+                        .take(displayed_length)
+                        .collect::<String>();
+                    if row.starts_with('\x00') {
+                        // TODO: colour.
+                        contents.push('<');
+                    }
+                    contents.push_str(&row);
+                    if self.rows[file_row]
+                        .render
+                        .chars()
+                        .nth(start_index + displayed_length)
+                        .unwrap_or('a')
+                        == '\x00'
+                    {
+                        contents.pop();
+                        // TODO: colour.
+                        contents.push('>');
+                    }
                 }
             }
             if !filled_line {
@@ -643,8 +714,8 @@ impl Editor {
     where
         F: Fn(&mut Editor, &str, Key) -> String,
     {
-        let mut input = "".to_string();
-        let mut message = "".to_string();
+        let mut input = String::new();
+        let mut message = String::new();
         loop {
             self.set_status_message(&format!(
                 "{} {}",
@@ -681,20 +752,17 @@ impl Editor {
 
     fn read_key(&self) -> Key {
         match self.input.recv() {
-            Ok(byte) => {
-                if byte == b'\x08' || byte == b'\x7f' {
+            Ok(c) => {
+                if c == '\x08' || c == '\x7f' {
                     Key::Backspace
-                } else if byte == b'\r' {
+                } else if c == '\r' {
                     Key::Enter
-                } else if byte == b'\x1b' {
+                } else if c == '\x1b' {
                     self.read_escape_sequence()
+                } else if c.is_control() {
+                    Key::Ctrl((c as u8 | 0b01100000) as char)
                 } else {
-                    let c = byte as char;
-                    if c.is_control() {
-                        Key::Ctrl((c as u8 | 0b01100000) as char)
-                    } else {
-                        Key::Char(c)
-                    }
+                    Key::Char(c)
                 }
             }
             Err(_) => panic!("Error reading from input channel"),
@@ -703,21 +771,21 @@ impl Editor {
 
     fn read_escape_sequence(&self) -> Key {
         match self.input.try_recv() {
-            Ok(b'[') => match self.input.try_recv() {
-                Ok(b'A') => Key::Arrow(Arrow::Up),   // <esc>[A
-                Ok(b'B') => Key::Arrow(Arrow::Down), // <esc>[B
-                Ok(b'C') => Key::Arrow(Arrow::Right), // <esc>[C
-                Ok(b'D') => Key::Arrow(Arrow::Left), // <esc>[D
-                Ok(b'H') => Key::Home,               // <esc>[H
-                Ok(b'F') => Key::End,                // <esc>[F
-                Ok(n @ b'0'..=b'9') => match self.input.try_recv() {
-                    Ok(b'~') => match n {
+            Ok('[') => match self.input.try_recv() {
+                Ok('A') => Key::Arrow(Arrow::Up),    // <esc>[A
+                Ok('B') => Key::Arrow(Arrow::Down),  // <esc>[B
+                Ok('C') => Key::Arrow(Arrow::Right), // <esc>[C
+                Ok('D') => Key::Arrow(Arrow::Left),  // <esc>[D
+                Ok('H') => Key::Home,                // <esc>[H
+                Ok('F') => Key::End,                 // <esc>[F
+                Ok(n @ '0'..='9') => match self.input.try_recv() {
+                    Ok('~') => match n {
                         // Match on the number before the tilde.
-                        b'1' | b'7' => Key::Home, // <esc>[1~ or <esc>[7~
-                        b'4' | b'8' => Key::End,  // <esc>[4~ or <esc>[8~
-                        b'3' => Key::Delete,      // <esc>[3~
-                        b'5' => Key::PageUp,      // <esc>[5~
-                        b'6' => Key::PageDown,    // <esc>[6~
+                        '1' | '7' => Key::Home, // <esc>[1~ or <esc>[7~
+                        '4' | '8' => Key::End,  // <esc>[4~ or <esc>[8~
+                        '3' => Key::Delete,     // <esc>[3~
+                        '5' => Key::PageUp,     // <esc>[5~
+                        '6' => Key::PageDown,   // <esc>[6~
                         _ => Key::Esc,
                     },
                     // Ignore all bytes after the esc.
@@ -732,9 +800,9 @@ impl Editor {
                     panic!("Input channel disconnected")
                 }
             },
-            Ok(b'O') => match self.input.try_recv() {
-                Ok(b'H') => Key::Home, // <esc>OH
-                Ok(b'F') => Key::End,  // <esc>OF
+            Ok('O') => match self.input.try_recv() {
+                Ok('H') => Key::Home, // <esc>OH
+                Ok('F') => Key::End,  // <esc>OF
                 // Ignore all bytes after the esc.
                 Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
                 Err(TryRecvError::Disconnected) => {
@@ -748,7 +816,7 @@ impl Editor {
             }
         }
     }
-    fn move_cursor(&mut self, arrow: Arrow) -> KeypressResult {
+    fn move_cursor(&mut self, arrow: Arrow) {
         match arrow {
             Arrow::Up => {
                 if self.cursor_position.y > 0 {
@@ -762,7 +830,7 @@ impl Editor {
                 } else if self.cursor_position.y > 0 {
                     self.cursor_position.y -= 1;
                     self.cursor_position.x =
-                        self.get_current_row().unwrap().chars.len();
+                        self.get_current_row().unwrap().chars.chars().count();
                 }
             }
             Arrow::Down => {
@@ -774,9 +842,11 @@ impl Editor {
             Arrow::Right => {
                 if let Some(row) = self.get_current_row() {
                     #[allow(clippy::comparison_chain)]
-                    if self.cursor_position.x < row.chars.len() {
+                    if self.cursor_position.x < row.chars.chars().count() {
                         self.cursor_position.x += 1
-                    } else if self.cursor_position.x == row.chars.len() {
+                    } else if self.cursor_position.x
+                        == row.chars.chars().count()
+                    {
                         self.cursor_position.y += 1;
                         self.cursor_position.x = 0;
                     }
@@ -785,7 +855,7 @@ impl Editor {
         };
 
         let row_length = if let Some(row) = self.get_current_row() {
-            row.chars.len()
+            row.chars.chars().count()
         } else {
             0
         };
@@ -794,8 +864,6 @@ impl Editor {
         if self.cursor_position.x > row_length {
             self.cursor_position.x = row_length;
         }
-
-        KeypressResult::Continue
     }
 
     fn scroll(&mut self) {
@@ -829,10 +897,11 @@ impl Editor {
     fn process_keypress(&mut self) -> KeypressResult {
         let key = self.read_key();
 
-        let result = match key {
+        let mut result = KeypressResult::Continue;
+
+        match key {
             Key::Enter => {
                 self.insert_newline();
-                KeypressResult::Continue
             }
             Key::Ctrl('q') => {
                 if self.dirty && self.quit_times > 0 {
@@ -842,19 +911,20 @@ impl Editor {
                         self.quit_times
                     ));
                     self.quit_times -= 1;
-                    return KeypressResult::Continue;
+                    return result;
+                } else {
+                    result = KeypressResult::Terminate;
                 }
-                KeypressResult::Terminate
             }
             Key::Ctrl('s') => {
                 self.save();
-                KeypressResult::Continue
             }
             Key::Ctrl('r') => {
                 self.find();
-                KeypressResult::Continue
             }
-            Key::Arrow(arrow) => self.move_cursor(arrow),
+            Key::Arrow(arrow) => {
+                self.move_cursor(arrow);
+            }
             key @ Key::PageUp | key @ Key::PageDown => {
                 match key {
                     Key::PageUp => self.cursor_position.y = self.text_offset.y,
@@ -876,38 +946,29 @@ impl Editor {
                         Arrow::Down
                     });
                 }
-                KeypressResult::Continue
             }
             Key::Home => {
                 self.cursor_position.x = 0;
-                KeypressResult::Continue
             }
             Key::End => {
                 if let Some(row) = self.get_current_row() {
-                    self.cursor_position.x = row.chars.len();
+                    self.cursor_position.x = row.chars.chars().count();
                 }
-                KeypressResult::Continue
             }
             Key::Backspace => {
                 self.delete_char();
-                KeypressResult::Continue
             }
             Key::Delete => {
                 self.move_cursor(Arrow::Right);
                 self.delete_char();
-                KeypressResult::Continue
             }
-            Key::Ctrl('l') | Key::Esc => {
-                // Ignore these keys.
-                KeypressResult::Continue
-            }
+            // Ignore these keys.
+            Key::Ctrl('l') | Key::Esc => {}
             Key::Char(c) => {
                 self.insert_char(c);
-                KeypressResult::Continue
             }
             Key::Ctrl(c) => {
                 self.insert_char((c as u8 & 0b10011111) as char);
-                KeypressResult::Continue
             }
         };
 
