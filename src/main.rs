@@ -6,10 +6,12 @@ use std::cmp;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::mem;
 use std::os::unix::io::AsRawFd;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 const VERSION: &str = "0.0.1";
@@ -61,6 +63,39 @@ struct Dimensions {
     cols: usize,
 }
 
+#[derive(Copy, Clone, PartialEq)]
+enum Color {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+    Default,
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum Highlight {
+    Normal,
+    Number,
+    String,
+    Comment,
+    MultilineComment,
+    Keyword1,
+    Keyword2,
+    Match,
+}
+
 enum KeypressResult {
     Continue,
     Terminate,
@@ -89,114 +124,110 @@ enum Key {
     Enter,
 }
 
+// *** Filetypes ***
+
+const HIGHLIGHT_NUMBERS: u32 = 1 << 0;
+const HIGHLIGHT_STRINGS: u32 = 1 << 1;
+
+struct Filetype {
+    name: &'static str,
+    filename_patterns: &'static [&'static str],
+    singleline_comment_start: &'static str,
+    multiline_comment_start: &'static str,
+    multiline_comment_end: &'static str,
+    keywords1: &'static [&'static str],
+    keywords2: &'static [&'static str],
+    flags: u32,
+}
+const FILETYPES: [Filetype; 3] = [
+    Filetype {
+        name: "c",
+        filename_patterns: &[".c", ".h", ".cpp"],
+        singleline_comment_start: "//",
+        multiline_comment_start: "/*",
+        multiline_comment_end: "*/",
+        keywords1: &[
+            "switch", "if", "while", "for", "break", "continue", "return",
+            "else", "struct", "union", "typedef", "static", "enum", "class",
+            "case",
+        ],
+        keywords2: &[
+            "int", "long", "double", "float", "char", "unsigned", "signed",
+            "void",
+        ],
+        flags: HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
+    },
+    Filetype {
+        name: "rust",
+        filename_patterns: &[".rs"],
+        singleline_comment_start: "//",
+        multiline_comment_start: "/*",
+        multiline_comment_end: "*/",
+        keywords1: &[
+            "if", "while", "for", "loop", "break", "continue", "return",
+            "else", "match", "mut", "fn", "move", "in", "as", "impl", "where",
+            "use",
+        ],
+        keywords2: &["let", "struct", "const", "enum"],
+        flags: HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
+    },
+    Filetype {
+        name: "python",
+        filename_patterns: &[".py"],
+        singleline_comment_start: "#",
+        multiline_comment_start: "",
+        multiline_comment_end: "",
+        keywords1: &[
+            "import", "from", "yield", "return", "if", "elif", "else", "while",
+            "for", "in", "is", "not", "and", "or",
+        ],
+        keywords2: &[
+            "def",
+            "str",
+            "set",
+            "dict",
+            "list",
+            "float",
+            "int",
+            "bool",
+            "print",
+            "enumerate",
+            "len",
+            "input",
+            "reversed",
+        ],
+        flags: HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
+    },
+];
+
+fn is_separator(c: char) -> bool {
+    c.is_whitespace() || "&,.()+-/*=~%<>[];".contains(c)
+}
+
 struct Row {
     chars: String,
     render: String,
-}
-
-impl Row {
-    fn update(&mut self) {
-        self.render = String::new();
-
-        let mut render_length = 0;
-
-        for c in self.chars.chars() {
-            if c == '\t' {
-                let mut tab_size = TAB_STOP - (render_length % TAB_STOP);
-                while tab_size > 0 {
-                    if !NON_PRINTING_CHARACTERS {
-                        self.render.push(' ');
-                    } else if tab_size == 1 {
-                        self.render.push('→');
-                    } else {
-                        self.render.push('—');
-                    }
-                    render_length += 1;
-                    tab_size -= 1;
-                }
-            } else if c == ' ' {
-                if NON_PRINTING_CHARACTERS {
-                    self.render.push('·');
-                } else {
-                    self.render.push(' ');
-                }
-                render_length += 1;
-            } else {
-                self.render.push(c);
-                render_length += 1;
-                for _ in 0..UnicodeWidthChar::width(c).unwrap_or(1) - 1 {
-                    self.render.push('\x00');
-                    render_length += 1;
-                }
-            }
-        }
-        if NON_PRINTING_CHARACTERS {
-            self.render.push('↵');
-        }
-    }
-
-    fn insert_char(&mut self, mut index: usize, c: char) {
-        let count = self.chars.chars().count();
-        if index > count {
-            index = count;
-        }
-
-        let mut new_chars = String::new();
-
-        if index == count {
-            self.chars.push(c);
-        } else {
-            for (i, char) in self.chars.chars().enumerate() {
-                if i == index {
-                    new_chars.push(c);
-                }
-                new_chars.push(char);
-            }
-
-            self.chars = new_chars;
-        }
-
-        self.update();
-    }
-
-    fn append_string(&mut self, s: &str) {
-        self.chars.push_str(s);
-        self.update();
-    }
-
-    fn delete_char(&mut self, index: usize) {
-        let count = self.chars.chars().count();
-        if index >= count {
-            return;
-        }
-
-        let mut new_chars = String::new();
-
-        for (i, char) in self.chars.chars().enumerate() {
-            if i != index {
-                new_chars.push(char);
-            }
-        }
-
-        self.chars = new_chars;
-        self.update();
-    }
+    highlight: Vec<Highlight>,
+    continue_multiline_comment: bool,
+    continue_multiline_string: Option<char>,
 }
 
 struct Editor {
     screen_dimensions: Dimensions,
     cursor_position: Position,
-    cursor_render_x: usize,
     input: Receiver<char>,
     text_offset: Position,
     rows: Vec<Row>,
     filename: Option<String>,
+    filetype: Option<&'static Filetype>,
     status_message: String,
     status_message_time: Instant,
     dirty: bool,
     quit_times: u8,
     matches: Vec<usize>,
     match_index: usize,
+    saved_highlight: Vec<Highlight>,
+    saved_highlight_index: usize,
 }
 
 impl Editor {
@@ -207,82 +238,443 @@ impl Editor {
         Editor {
             screen_dimensions,
             cursor_position: Position { x: 0, y: 0 },
-            cursor_render_x: 0,
             input: spawn_stdin_channel(),
             text_offset: Position { x: 0, y: 0 },
             rows: Vec::new(),
             filename: None,
+            filetype: None,
             status_message: String::new(),
             status_message_time: Instant::now(),
             dirty: false,
             quit_times: QUIT_TIMES,
             matches: Vec::new(),
             match_index: 0,
+            saved_highlight: Vec::new(),
+            saved_highlight_index: 0,
+        }
+    }
+
+    fn highlight_to_color(highlight: Highlight) -> Color {
+        match highlight {
+            Highlight::Number => Color::Magenta,
+            Highlight::String => Color::Yellow,
+            Highlight::Comment | Highlight::MultilineComment => {
+                Color::BrightBlack
+            }
+            Highlight::Keyword1 => Color::Red,
+            Highlight::Keyword2 => Color::Cyan,
+            Highlight::Match => Color::Blue,
+            _ => Color::White,
+        }
+    }
+
+    fn detect_filetype(&mut self) {
+        match &self.filename {
+            Some(name) => {
+                for filetype in &FILETYPES {
+                    for pattern in filetype.filename_patterns {
+                        if (pattern.starts_with('.') && name.ends_with(pattern))
+                            || (!pattern.starts_with('.')
+                                && name.contains(pattern))
+                        {
+                            self.filetype = Some(filetype);
+                            for y in 0..self.rows.len() {
+                                self.update_row_highlight(y);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            None => {}
         }
     }
 
     // *** Row Operations ***
+
+    fn update_row_highlight(&mut self, y: usize) {
+        if y >= self.rows.len() {
+            return;
+        }
+        let (first, last) = self.rows.split_at_mut(y);
+        let row = &mut last[0];
+
+        row.highlight.clear();
+        let mut chars = row.render.char_indices().enumerate();
+        let line_length = row.render.chars().count();
+
+        let singleline_comment_start = if let Some(f) = self.filetype {
+            f.singleline_comment_start
+        } else {
+            ""
+        };
+        let multiline_comment_start = if let Some(f) = self.filetype {
+            f.multiline_comment_start
+        } else {
+            ""
+        };
+        let multiline_comment_end = if let Some(f) = self.filetype {
+            f.multiline_comment_end
+        } else {
+            ""
+        };
+
+        let mut prev_separator = true;
+        let mut in_singleline_comment = false;
+        let mut in_multiline_comment =
+            y != 0 && first[first.len() - 1].continue_multiline_comment;
+
+        let mut quote = if y == 0 || in_multiline_comment {
+            None
+        } else {
+            first[first.len() - 1].continue_multiline_string
+        };
+
+        loop {
+            let prev_highlight =
+                *row.highlight.last().unwrap_or(&Highlight::Normal);
+            let next = chars.next();
+            if let Some((i, (byte_index, c))) = next {
+                if self.filetype.is_none() {
+                    row.highlight.push(Highlight::Normal);
+                    continue;
+                }
+
+                if in_singleline_comment {
+                    row.highlight.push(Highlight::Comment);
+                    continue;
+                }
+
+                if !singleline_comment_start.is_empty()
+                    && quote.is_none()
+                    && !in_multiline_comment
+                    && row.render[byte_index..]
+                        .starts_with(singleline_comment_start)
+                {
+                    in_singleline_comment = true;
+                    row.highlight.push(Highlight::Comment);
+                    continue;
+                }
+
+                if !multiline_comment_start.is_empty() && quote.is_none() {
+                    if in_multiline_comment {
+                        if row.render[byte_index..]
+                            .starts_with(multiline_comment_end)
+                        {
+                            row.highlight.push(Highlight::MultilineComment);
+                            for _ in 0..multiline_comment_end.len() - 1 {
+                                chars.next();
+                                row.highlight.push(Highlight::MultilineComment);
+                            }
+                            in_multiline_comment = false;
+                        } else {
+                            row.highlight.push(Highlight::MultilineComment);
+                        }
+                        continue;
+                    } else if row.render[byte_index..]
+                        .starts_with(multiline_comment_start)
+                    {
+                        row.highlight.push(Highlight::MultilineComment);
+                        for _ in 0..multiline_comment_start.len() - 1 {
+                            chars.next();
+                            row.highlight.push(Highlight::MultilineComment);
+                        }
+                        in_multiline_comment = true;
+                        continue;
+                    }
+                }
+
+                if self.filetype.unwrap().flags & HIGHLIGHT_STRINGS != 0 {
+                    match quote {
+                        Some(q) => {
+                            // In a string.
+                            row.highlight.push(Highlight::String);
+                            if c == '\\' {
+                                if i < line_length - 1 {
+                                    row.highlight.push(Highlight::String);
+                                    chars.next();
+                                    if i == line_length - 2 {
+                                        quote = None;
+                                    }
+                                }
+                            } else if c == q {
+                                // String ends.
+                                quote = None;
+                                prev_separator = true;
+                            } else if i == line_length - 1 {
+                                quote = None;
+                            }
+                            continue;
+                        }
+                        None => {
+                            // Not in a string.
+                            if c == '"' || c == '\'' {
+                                // String starts.
+                                quote = Some(c);
+                                row.highlight.push(Highlight::String);
+                                if i == line_length - 1 {
+                                    quote = None;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if self.filetype.unwrap().flags & HIGHLIGHT_NUMBERS != 0
+                    && ((c.is_digit(10)
+                        && (prev_separator
+                            || prev_highlight == Highlight::Number))
+                        || (c == '.' && prev_highlight == Highlight::Number))
+                {
+                    row.highlight.push(Highlight::Number);
+                    prev_separator = false;
+                    continue;
+                }
+
+                if prev_separator {
+                    let mut found_keyword = false;
+                    'outer: for (keywords, highlight) in [
+                        (self.filetype.unwrap().keywords1, Highlight::Keyword1),
+                        (self.filetype.unwrap().keywords2, Highlight::Keyword2),
+                    ] {
+                        for keyword in keywords {
+                            if row.render[byte_index..].starts_with(keyword)
+                                && is_separator(
+                                    row.render[byte_index + keyword.len()..]
+                                        .chars()
+                                        .next()
+                                        .unwrap_or(' '),
+                                )
+                            {
+                                row.highlight.push(highlight);
+                                for _ in 0..keyword.len() - 1 {
+                                    chars.next();
+                                    row.highlight.push(highlight);
+                                }
+                                found_keyword = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                    if found_keyword {
+                        prev_separator = false;
+                        continue;
+                    }
+                }
+
+                row.highlight.push(Highlight::Normal);
+                prev_separator = is_separator(c);
+            } else {
+                break;
+            }
+        }
+
+        let changed = row.continue_multiline_string != quote
+            || row.continue_multiline_comment != in_multiline_comment;
+        row.continue_multiline_comment = in_multiline_comment;
+        row.continue_multiline_string = quote;
+        if changed {
+            self.update_row_highlight(y + 1);
+        }
+    }
+
+    fn update_row_render(&mut self, y: usize) {
+        if y >= self.rows.len() {
+            return;
+        }
+        let row = &mut self.rows[y];
+        row.render.clear();
+
+        let mut render_length = 0;
+
+        for c in row.chars.chars() {
+            if c == '\t' {
+                let mut tab_size = TAB_STOP - (render_length % TAB_STOP);
+                while tab_size > 0 {
+                    if !NON_PRINTING_CHARACTERS {
+                        row.render.push(' ');
+                    } else if tab_size == 1 {
+                        row.render.push('→');
+                    } else {
+                        row.render.push('—');
+                    }
+                    render_length += 1;
+                    tab_size -= 1;
+                }
+            } else if c.is_control() {
+                row.render.push(c);
+                render_length += 1;
+            } else if c == ' ' {
+                if NON_PRINTING_CHARACTERS {
+                    row.render.push('·');
+                } else {
+                    row.render.push(' ');
+                }
+                render_length += 1;
+            } else {
+                row.render.push(c);
+                render_length += 1;
+                for _ in 0..UnicodeWidthChar::width(c).unwrap_or(1) - 1 {
+                    render_length += 1;
+                }
+            }
+        }
+        if NON_PRINTING_CHARACTERS {
+            row.render.push('↵');
+        }
+    }
+
+    fn update_row(&mut self, y: usize) {
+        self.update_row_render(y);
+        self.update_row_highlight(y);
+    }
+
+    fn insert_char_in_row(&mut self, y: usize, mut index: usize, c: char) {
+        if y >= self.rows.len() {
+            return;
+        }
+        let row = &mut self.rows[y];
+        let count = row.chars.chars().count();
+        if index > count {
+            index = count;
+        }
+
+        let mut new_chars = String::new();
+
+        if index == count {
+            row.chars.push(c);
+        } else {
+            for (i, char) in row.chars.chars().enumerate() {
+                if i == index {
+                    new_chars.push(c);
+                }
+                new_chars.push(char);
+            }
+
+            row.chars = new_chars;
+        }
+
+        self.update_row(y);
+    }
+
+    fn append_string_to_row(&mut self, y: usize, s: &str) {
+        if y >= self.rows.len() {
+            return;
+        }
+        let row = &mut self.rows[y];
+        row.chars.push_str(s);
+        self.update_row(y);
+    }
+
+    fn delete_char_in_row(&mut self, y: usize, index: usize) {
+        if y >= self.rows.len() {
+            return;
+        }
+        let row = &mut self.rows[y];
+        let count = row.chars.chars().count();
+        if index >= count {
+            return;
+        }
+
+        let mut new_chars = String::new();
+
+        for (i, char) in row.chars.chars().enumerate() {
+            if i != index {
+                new_chars.push(char);
+            }
+        }
+
+        row.chars = new_chars;
+        self.update_row(y);
+    }
 
     fn insert_row(&mut self, index: usize, chars: &str) {
         if index > self.rows.len() {
             return;
         }
 
-        let mut row = Row {
+        let row = Row {
             chars: chars.to_string(),
             render: String::new(),
+            highlight: Vec::new(),
+            continue_multiline_comment: false,
+            continue_multiline_string: None,
         };
-        row.update();
         self.rows.insert(index, row);
+        self.update_row(index);
         self.dirty = true;
     }
 
-    fn get_render_index(&self) -> usize {
-        if self.cursor_position.y >= self.rows.len()
-            || self.cursor_position.x == 0
-        {
+    fn get_screen_index(&self, x: usize, y: usize) -> usize {
+        if y >= self.rows.len() || x == 0 {
             return 0;
         }
 
-        let mut render_index = 0;
+        let mut screen_index = 0;
 
-        for c in self
-            .get_current_row()
-            .unwrap()
-            .chars
-            .chars()
-            .take(self.cursor_position.x)
-        {
+        let row = &self.rows[y];
+
+        for c in row.chars.chars().take(x) {
             if c == '\t' {
-                render_index += (TAB_STOP - 1) - (render_index % TAB_STOP);
+                screen_index += (TAB_STOP - 1) - (screen_index % TAB_STOP) + 1;
+            } else if c.is_control() {
+                screen_index += 1;
             } else {
-                render_index += UnicodeWidthChar::width(c).unwrap_or(0);
+                screen_index += UnicodeWidthChar::width(c).unwrap_or(0);
             }
         }
-        render_index
+        screen_index
     }
 
-    fn get_char_index(&self) -> usize {
-        if self.cursor_position.y >= self.rows.len()
-            || self.cursor_render_x == 0
-        {
+    fn get_current_screen_index(&self) -> usize {
+        self.get_screen_index(self.cursor_position.x, self.cursor_position.y)
+    }
+
+    fn screen_index_to_char_index(
+        screen_index: usize,
+        row: Option<&Row>,
+    ) -> usize {
+        if row.is_none() || screen_index == 0 {
             return 0;
         }
 
         let mut char_index = 0;
-        let mut render_index = 0;
+        let mut i = 0;
 
-        for c in self.get_current_row().unwrap().chars.chars() {
+        for c in row.unwrap().chars.chars() {
             if c == '\t' {
-                render_index += (TAB_STOP - 1) - (render_index % TAB_STOP);
+                i += (TAB_STOP - 1) - (i % TAB_STOP) + 1;
+            } else if c.is_control() {
+                i += 1;
+            } else {
+                i += UnicodeWidthChar::width(c).unwrap_or(0);
             }
-            render_index += 1;
+
             char_index += 1;
-            if render_index >= self.cursor_render_x {
+            if i >= screen_index {
                 return char_index;
             }
         }
         char_index
+    }
+
+    fn get_render_index(&self, x: usize, y: usize) -> usize {
+        if y >= self.rows.len() || x == 0 {
+            return 0;
+        }
+
+        let mut render_index = 0;
+
+        let row = &self.rows[y];
+
+        for c in row.chars.chars().take(x) {
+            if c == '\t' {
+                render_index += (TAB_STOP - 1) - (render_index % TAB_STOP) + 1;
+            } else {
+                render_index += 1;
+            }
+        }
+        render_index
     }
 
     fn get_current_row(&self) -> Option<&Row> {
@@ -299,8 +691,12 @@ impl Editor {
         if self.cursor_position.y == self.rows.len() {
             self.insert_row(self.rows.len(), "");
         }
-        self.rows[self.cursor_position.y]
-            .insert_char(self.cursor_position.x, c);
+
+        self.insert_char_in_row(
+            self.cursor_position.y,
+            self.cursor_position.x,
+            c,
+        );
         self.cursor_position.x += 1;
         self.dirty = true;
     }
@@ -314,17 +710,17 @@ impl Editor {
         }
 
         if self.cursor_position.x > 0 {
-            self.rows[self.cursor_position.y]
-                .delete_char(self.cursor_position.x - 1);
+            self.delete_char_in_row(
+                self.cursor_position.y,
+                self.cursor_position.x - 1,
+            );
             self.cursor_position.x -= 1;
             self.dirty = true;
         } else {
             self.cursor_position.x =
                 self.rows[self.cursor_position.y - 1].chars.chars().count();
-            let (start, end) = self.rows.split_at_mut(self.cursor_position.y);
-            let previous_row = start.last_mut().unwrap();
-            let current_row = &end[0];
-            previous_row.append_string(&current_row.chars);
+            let chars = mem::take(&mut self.rows[self.cursor_position.y].chars);
+            self.append_string_to_row(self.cursor_position.y - 1, &chars);
             self.delete_row(self.cursor_position.y);
             self.cursor_position.y -= 1;
         }
@@ -334,16 +730,19 @@ impl Editor {
         if self.cursor_position.x == 0 {
             self.insert_row(self.cursor_position.y, "");
         } else {
-            let new_row_contents = self.rows[self.cursor_position.y]
+            let row = &mut self.rows[self.cursor_position.y];
+            let split_at = row
                 .chars
-                .split_at(self.cursor_position.x)
-                .1
-                .to_string();
+                .char_indices()
+                .nth(self.cursor_position.x)
+                .unwrap_or((row.chars.len(), 'a'))
+                .0;
+            let new_row_contents = row.chars.split_at(split_at).1.to_string();
+
+            row.chars.truncate(split_at);
+
             self.insert_row(self.cursor_position.y + 1, &new_row_contents);
-            self.rows[self.cursor_position.y]
-                .chars
-                .truncate(self.cursor_position.x);
-            self.rows[self.cursor_position.y].update();
+            self.update_row(self.cursor_position.y);
         }
         self.cursor_position.y += 1;
         self.cursor_position.x = 0;
@@ -361,7 +760,17 @@ impl Editor {
     // *** File I/O ***
 
     fn open(&mut self, filename: &str) {
-        let f = File::open(filename).expect("Failed to open file");
+        let f = match File::open(filename) {
+            Ok(f) => f,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    File::create(filename).expect("Unable to create file.");
+                    File::open(filename).expect("Unable to open file.")
+                } else {
+                    panic!("Unable to open file.")
+                }
+            }
+        };
         let reader = BufReader::new(f);
         let lines = reader.lines();
 
@@ -370,6 +779,7 @@ impl Editor {
         }
 
         self.filename = Some(filename.to_string());
+        self.detect_filetype();
         self.dirty = false;
     }
 
@@ -391,6 +801,7 @@ impl Editor {
                 self.set_status_message("Save aborted");
                 return;
             }
+            self.detect_filetype();
         }
 
         match File::create(self.filename.as_ref().unwrap()) {
@@ -418,6 +829,15 @@ impl Editor {
     // *** Find ***
 
     fn find_callback(&mut self, query: &str, key: Key) -> String {
+        if !self.saved_highlight.is_empty() {
+            std::mem::swap(
+                &mut self.saved_highlight,
+                &mut self.rows[self.saved_highlight_index].highlight,
+            );
+            self.saved_highlight.clear();
+            self.saved_highlight_index = 0;
+        }
+
         if query.is_empty() {
             return String::new();
         }
@@ -465,14 +885,35 @@ impl Editor {
         }
 
         let row = &self.rows[self.matches[self.match_index]];
+        // TODO: Only finds the first match in each line.
         let row_index = regex.find(&row.chars).unwrap();
         self.cursor_position.y = self.matches[self.match_index];
         self.text_offset.y = self.matches[self.match_index];
+        // Translate the byte offsets into char offsets.
+        let mut start = 0;
+        let mut end = 0;
         for (i, (byte_offset, _)) in row.chars.char_indices().enumerate() {
-            if byte_offset >= row_index.start() {
-                self.cursor_position.x = i;
+            if byte_offset == row_index.start() {
+                start = i;
+            }
+            if byte_offset == row_index.end() - 1 {
+                end = i;
                 break;
             }
+        }
+
+        self.cursor_position.x = start;
+
+        // Highlight the match.
+        self.saved_highlight_index = self.matches[self.match_index];
+        self.saved_highlight = row.highlight.clone();
+        let render_start = self.get_render_index(start, self.cursor_position.y);
+        let render_end = self.get_render_index(end, self.cursor_position.y);
+
+        let row = &mut self.rows[self.matches[self.match_index]];
+
+        for i in render_start..render_end + 1 {
+            row.highlight[i] = Highlight::Match;
         }
 
         format!(
@@ -532,7 +973,39 @@ impl Editor {
         contents.push_str("\x1b[?25h");
     }
 
+    fn set_color(contents: &mut String, color: Color) {
+        let color_code = match color {
+            Color::Black => "0;30",
+            Color::Red => "0;31",
+            Color::Green => "0;32",
+            Color::Yellow => "0;33",
+            Color::Blue => "0;34",
+            Color::Magenta => "0;35",
+            Color::Cyan => "0;36",
+            Color::White => "0;37",
+            Color::BrightBlack => "1;30",
+            Color::BrightRed => "1;31",
+            Color::BrightGreen => "1;32",
+            Color::BrightYellow => "1;33",
+            Color::BrightBlue => "1;34",
+            Color::BrightMagenta => "1;35",
+            Color::BrightCyan => "1;36",
+            Color::BrightWhite => "1;37",
+            Color::Default => "0;39",
+        };
+        contents.push_str(&format!("\x1b[{}m", color_code));
+    }
+
+    fn invert_colors(contents: &mut String) {
+        contents.push_str("\x1b[7m");
+    }
+
+    fn clear_formatting(contents: &mut String) {
+        contents.push_str("\x1b[m");
+    }
+
     fn draw_rows(&self, contents: &mut String) {
+        let line_number_padding = format!("{}", self.rows.len()).len();
         for y in 0..self.screen_dimensions.rows {
             let mut filled_line = false;
             let file_row = y + self.text_offset.y;
@@ -549,8 +1022,9 @@ impl Editor {
                     let mut padding =
                         (self.screen_dimensions.cols - message_length) / 2;
                     if padding > 0 {
-                        // TODO: colour.
+                        Editor::set_color(contents, Color::Blue);
                         contents.push('~');
+                        Editor::set_color(contents, Color::Default);
                         padding -= 1;
                     }
 
@@ -560,43 +1034,115 @@ impl Editor {
 
                     contents.push_str(&welcome_message[..message_length]);
                 } else {
-                    // TODO: colour.
+                    Editor::set_color(contents, Color::Blue);
                     contents.push('~');
+                    Editor::set_color(contents, Color::Default);
                 }
             } else {
-                let line_length = self.rows[file_row].render.chars().count();
+                Editor::set_color(contents, Color::BrightBlack);
+                contents.push_str(&format!(
+                    "{:>width$} ",
+                    file_row + 1,
+                    width = line_number_padding
+                ));
+                Editor::set_color(contents, Color::Default);
+
+                let line_length = self.rows[file_row]
+                    .render
+                    .chars()
+                    .map(|c| {
+                        if c.is_control() {
+                            1
+                        } else {
+                            UnicodeWidthChar::width(c).unwrap_or(0)
+                        }
+                    })
+                    .sum();
                 // Check if any of this line is visible.
                 if self.text_offset.x < line_length {
                     let mut displayed_length = line_length - self.text_offset.x;
                     // Cap the displayed length to the length of the screen.
-                    if displayed_length >= self.screen_dimensions.cols {
-                        displayed_length = self.screen_dimensions.cols;
+                    if displayed_length
+                        >= self.screen_dimensions.cols
+                            - (line_number_padding + 1)
+                    {
+                        displayed_length = self.screen_dimensions.cols
+                            - (line_number_padding + 1);
                         filled_line = true;
                     }
                     // Start displaying the line at the text offset.
+                    let row = &self.rows[file_row];
                     let start_index = self.text_offset.x;
-                    let row = self.rows[file_row]
-                        .render
-                        .chars()
-                        .skip(start_index)
-                        .take(displayed_length)
-                        .collect::<String>();
-                    if row.starts_with('\x00') {
-                        // TODO: colour.
-                        contents.push('<');
+                    let mut current_color = Color::Default;
+                    let mut i = 0;
+                    let mut prev_width = 0;
+                    for (char_index, c) in row.render.chars().enumerate() {
+                        let curr_width = if c.is_control() {
+                            1
+                        } else {
+                            UnicodeWidthChar::width(c).unwrap_or(0)
+                        };
+                        if i >= start_index
+                            && i < start_index + displayed_length
+                        {
+                            if prev_width > 1
+                                && i > start_index
+                                && i - prev_width < start_index
+                            {
+                                // There's a cut off wide character at the start
+                                // of the row.
+                                Editor::set_color(contents, Color::Blue);
+                                contents.push('<');
+                                Editor::set_color(contents, current_color);
+                            } else if curr_width > 1
+                                && i + curr_width
+                                    > start_index + displayed_length
+                            {
+                                // There's a cut off wide character at the end
+                                // of the row.
+                                Editor::set_color(contents, Color::Blue);
+                                contents.push('>');
+                                Editor::set_color(contents, current_color);
+                                prev_width = curr_width;
+                                i += curr_width;
+                                continue;
+                            }
+
+                            if c.is_control() {
+                                Editor::invert_colors(contents);
+                                contents.push(if c as u8 <= 26 {
+                                    (c as u8 | !0b10111111) as char
+                                } else {
+                                    '?'
+                                });
+                                Editor::clear_formatting(contents);
+                                Editor::set_color(contents, current_color);
+                            } else {
+                                let highlight = row.highlight[char_index];
+                                if let Highlight::Normal = highlight {
+                                    if current_color != Color::Default {
+                                        Editor::set_color(
+                                            contents,
+                                            Color::Default,
+                                        );
+                                        current_color = Color::Default;
+                                    }
+                                    contents.push(c);
+                                } else {
+                                    let color =
+                                        Editor::highlight_to_color(highlight);
+                                    if current_color != color {
+                                        Editor::set_color(contents, color);
+                                        current_color = color;
+                                    }
+                                    contents.push(c);
+                                }
+                            }
+                        }
+                        prev_width = curr_width;
+                        i += curr_width;
                     }
-                    contents.push_str(&row);
-                    if self.rows[file_row]
-                        .render
-                        .chars()
-                        .nth(start_index + displayed_length)
-                        .unwrap_or('a')
-                        == '\x00'
-                    {
-                        contents.pop();
-                        // TODO: colour.
-                        contents.push('>');
-                    }
+                    Editor::set_color(contents, Color::Default);
                 }
             }
             if !filled_line {
@@ -608,7 +1154,7 @@ impl Editor {
     }
 
     fn draw_status_bar(&self, contents: &mut String) {
-        contents.push_str("\x1b[7m"); // Invert colours.
+        Editor::invert_colors(contents);
 
         let filename = match &self.filename {
             Some(filename) => {
@@ -629,7 +1175,12 @@ impl Editor {
         );
 
         let right_status = format!(
-            "{}:{} ",
+            "{} | {}:{} ",
+            if self.filetype.is_none() {
+                "no ft"
+            } else {
+                self.filetype.unwrap().name
+            },
             self.cursor_position.y + 1,
             self.cursor_position.x + 1
         );
@@ -649,7 +1200,7 @@ impl Editor {
             contents.push_str(&status);
         }
 
-        contents.push_str("\x1b[m"); // Un-invert colours.
+        Editor::clear_formatting(contents);
         contents.push_str("\r\n");
     }
 
@@ -686,8 +1237,11 @@ impl Editor {
         self.draw_status_bar(&mut contents);
         self.draw_message_bar(&mut contents);
 
+        let line_number_space = format!("{}", self.rows.len()).len() + 1;
+
         let cursor_screen_position = Position {
-            x: self.cursor_render_x - self.text_offset.x,
+            x: self.get_current_screen_index() - self.text_offset.x
+                + line_number_space,
             y: self.cursor_position.y - self.text_offset.y,
         };
         Editor::draw_cursor(&mut contents, &cursor_screen_position);
@@ -770,7 +1324,7 @@ impl Editor {
     }
 
     fn read_escape_sequence(&self) -> Key {
-        match self.input.try_recv() {
+        match self.input.recv_timeout(Duration::from_millis(100)) {
             Ok('[') => match self.input.try_recv() {
                 Ok('A') => Key::Arrow(Arrow::Up),    // <esc>[A
                 Ok('B') => Key::Arrow(Arrow::Down),  // <esc>[B
@@ -778,40 +1332,44 @@ impl Editor {
                 Ok('D') => Key::Arrow(Arrow::Left),  // <esc>[D
                 Ok('H') => Key::Home,                // <esc>[H
                 Ok('F') => Key::End,                 // <esc>[F
-                Ok(n @ '0'..='9') => match self.input.try_recv() {
-                    Ok('~') => match n {
-                        // Match on the number before the tilde.
-                        '1' | '7' => Key::Home, // <esc>[1~ or <esc>[7~
-                        '4' | '8' => Key::End,  // <esc>[4~ or <esc>[8~
-                        '3' => Key::Delete,     // <esc>[3~
-                        '5' => Key::PageUp,     // <esc>[5~
-                        '6' => Key::PageDown,   // <esc>[6~
-                        _ => Key::Esc,
-                    },
+                Ok(n @ '0'..='9') => {
+                    match self.input.recv_timeout(Duration::from_millis(100)) {
+                        Ok('~') => match n {
+                            // Match on the number before the tilde.
+                            '1' | '7' => Key::Home, // <esc>[1~ or <esc>[7~
+                            '4' | '8' => Key::End,  // <esc>[4~ or <esc>[8~
+                            '3' => Key::Delete,     // <esc>[3~
+                            '5' => Key::PageUp,     // <esc>[5~
+                            '6' => Key::PageDown,   // <esc>[6~
+                            _ => Key::Esc,
+                        },
+                        // Ignore all bytes after the esc.
+                        Ok(_) | Err(RecvTimeoutError::Timeout) => Key::Esc,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            panic!("Input channel disconnected")
+                        }
+                    }
+                }
+                // Ignore all bytes after the esc.
+                Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("Input channel disconnected")
+                }
+            },
+            Ok('O') => {
+                match self.input.recv_timeout(Duration::from_millis(100)) {
+                    Ok('H') => Key::Home, // <esc>OH
+                    Ok('F') => Key::End,  // <esc>OF
                     // Ignore all bytes after the esc.
-                    Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
-                    Err(TryRecvError::Disconnected) => {
+                    Ok(_) | Err(RecvTimeoutError::Timeout) => Key::Esc,
+                    Err(RecvTimeoutError::Disconnected) => {
                         panic!("Input channel disconnected")
                     }
-                },
-                // Ignore all bytes after the esc.
-                Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
-                Err(TryRecvError::Disconnected) => {
-                    panic!("Input channel disconnected")
                 }
-            },
-            Ok('O') => match self.input.try_recv() {
-                Ok('H') => Key::Home, // <esc>OH
-                Ok('F') => Key::End,  // <esc>OF
-                // Ignore all bytes after the esc.
-                Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
-                Err(TryRecvError::Disconnected) => {
-                    panic!("Input channel disconnected")
-                }
-            },
+            }
             // Ignore the byte after the esc if there is one.
-            Ok(_) | Err(TryRecvError::Empty) => Key::Esc,
-            Err(TryRecvError::Disconnected) => {
+            Ok(_) | Err(RecvTimeoutError::Timeout) => Key::Esc,
+            Err(RecvTimeoutError::Disconnected) => {
                 panic!("Input channel disconnected")
             }
         }
@@ -820,8 +1378,12 @@ impl Editor {
         match arrow {
             Arrow::Up => {
                 if self.cursor_position.y > 0 {
+                    let screen_index = self.get_current_screen_index();
                     self.cursor_position.y -= 1;
-                    self.cursor_position.x = self.get_char_index();
+                    self.cursor_position.x = Editor::screen_index_to_char_index(
+                        screen_index,
+                        self.get_current_row(),
+                    );
                 }
             }
             Arrow::Left => {
@@ -835,8 +1397,12 @@ impl Editor {
             }
             Arrow::Down => {
                 if self.cursor_position.y < self.rows.len() {
+                    let screen_index = self.get_current_screen_index();
                     self.cursor_position.y += 1;
-                    self.cursor_position.x = self.get_char_index();
+                    self.cursor_position.x = Editor::screen_index_to_char_index(
+                        screen_index,
+                        self.get_current_row(),
+                    );
                 }
             }
             Arrow::Right => {
@@ -869,7 +1435,7 @@ impl Editor {
     fn scroll(&mut self) {
         // Update which part of the file we're looking at based on the new
         // position of the cursor.
-        self.cursor_render_x = self.get_render_index();
+        let screen_x = self.get_current_screen_index();
 
         if self.cursor_position.y < self.text_offset.y {
             self.text_offset.y = self.cursor_position.y;
@@ -882,15 +1448,12 @@ impl Editor {
                 self.cursor_position.y - self.screen_dimensions.rows + 1;
         }
 
-        if self.cursor_render_x < self.text_offset.x {
-            self.text_offset.x = self.cursor_render_x;
+        if screen_x < self.text_offset.x {
+            self.text_offset.x = screen_x;
         }
 
-        if self.cursor_render_x
-            >= self.text_offset.x + self.screen_dimensions.cols
-        {
-            self.text_offset.x =
-                self.cursor_render_x - self.screen_dimensions.cols + 1;
+        if screen_x >= self.text_offset.x + self.screen_dimensions.cols {
+            self.text_offset.x = screen_x - self.screen_dimensions.cols + 1;
         }
     }
 
