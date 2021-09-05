@@ -201,7 +201,7 @@ const FILETYPES: [Filetype; 3] = [
 ];
 
 fn is_separator(c: char) -> bool {
-    c.is_whitespace() || "&,.()+-/*=~%<>[];".contains(c)
+    c.is_whitespace() || "&,.()+-/*=~%<>[]; ".contains(c)
 }
 
 struct Row {
@@ -210,6 +210,37 @@ struct Row {
     highlight: Vec<Highlight>,
     continue_multiline_comment: bool,
     continue_multiline_string: Option<char>,
+}
+
+impl Row {
+    fn zip(&self) -> Vec<(char, usize, char, Highlight)> {
+        let mut result = Vec::new();
+
+        let mut render_iter = self.render.chars();
+        let mut render_length = 0;
+        let mut highlight_iter = self.highlight.iter();
+
+        for (i, c) in self.chars.chars().enumerate() {
+            if c == '\t' {
+                let mut tab_size = TAB_STOP - (render_length % TAB_STOP);
+                while tab_size > 0 {
+                    result.push((c, i, render_iter.next().unwrap(), *highlight_iter.next().unwrap()));
+                    render_length += 1;
+                    tab_size -= 1;
+                }
+            } else if c.is_control() {
+                result.push((c, i, render_iter.next().unwrap(), *highlight_iter.next().unwrap()));
+                render_length += 1;
+            } else {
+                result.push((c, i, render_iter.next().unwrap(), *highlight_iter.next().unwrap()));
+                render_length += 1;
+                for _ in 0..UnicodeWidthChar::width(c).unwrap_or(1) - 1 {
+                    render_length += 1;
+                }
+            }
+        }
+        result
+    }
 }
 
 struct Editor {
@@ -600,6 +631,8 @@ impl Editor {
         self.dirty = true;
     }
 
+    // TODO: get_screen_index, screen_index_to_char_index and get_render_index
+    // are pretty similar.
     fn get_screen_index(&self, x: usize, y: usize) -> usize {
         if y >= self.rows.len() || x == 0 {
             return 0;
@@ -1069,78 +1102,93 @@ impl Editor {
                     let row = &self.rows[file_row];
                     let start_index = self.text_offset.x;
                     let mut current_color = Color::Default;
-                    let mut i = 0;
+                    let mut screen_index = 0;
                     let mut prev_width = 0;
-                    for (char_index, c) in row.render.chars().enumerate() {
-                        let curr_width = if c.is_control() {
-                            1
-                        } else {
-                            UnicodeWidthChar::width(c).unwrap_or(0)
-                        };
-                        if i >= start_index
-                            && i < start_index + displayed_length
-                        {
-                            if prev_width > 1
-                                && i > start_index
-                                && i - prev_width < start_index
-                            {
-                                // There's a cut off wide character at the start
-                                // of the row.
-                                Editor::set_color(contents, Color::Blue);
-                                contents.push('<');
-                                Editor::set_color(contents, current_color);
-                            } else if curr_width > 1
-                                && i + curr_width
-                                    > start_index + displayed_length
-                            {
-                                // There's a cut off wide character at the end
-                                // of the row.
-                                Editor::set_color(contents, Color::Blue);
-                                contents.push('>');
-                                Editor::set_color(contents, current_color);
-                                prev_width = curr_width;
-                                i += curr_width;
-                                continue;
-                            }
 
-                            // TODO: Tabs look like spaces.
-                            if RENDER_WHITESPACE && c == ' ' {
-                                Editor::set_color(contents, Color::BrightBlack);
-                                contents.push('∙');
-                                Editor::set_color(contents, current_color);
-                            } else if c.is_control() {
-                                Editor::invert_colors(contents);
-                                contents.push(if c as u8 <= 26 {
-                                    (c as u8 | !0b10111111) as char
-                                } else {
-                                    '?'
-                                });
-                                Editor::clear_formatting(contents);
-                                Editor::set_color(contents, current_color);
+                    let mut zip = row.zip().into_iter().peekable();
+
+                    loop {
+                        let next = zip.next();
+                        if let Some((char, char_index, render, highlight)) = next {
+                            let curr_width = if char.is_control() {
+                                1
                             } else {
-                                let highlight = row.highlight[char_index];
-                                if let Highlight::Normal = highlight {
-                                    if current_color != Color::Default {
-                                        Editor::set_color(
-                                            contents,
-                                            Color::Default,
-                                        );
-                                        current_color = Color::Default;
+                                UnicodeWidthChar::width(char).unwrap_or(0)
+                            };
+                            if screen_index >= start_index
+                                && screen_index < start_index + displayed_length
+                            {
+                                if prev_width > 1
+                                    && screen_index > start_index
+                                    && screen_index - prev_width < start_index
+                                {
+                                    // There's a cut off wide character at the start
+                                    // of the row.
+                                    Editor::set_color(contents, Color::Blue);
+                                    contents.push('<');
+                                    Editor::set_color(contents, current_color);
+                                } else if curr_width > 1
+                                    && screen_index + curr_width
+                                        > start_index + displayed_length
+                                {
+                                    // There's a cut off wide character at the end
+                                    // of the row.
+                                    Editor::set_color(contents, Color::Blue);
+                                    contents.push('>');
+                                    Editor::set_color(contents, current_color);
+                                    prev_width = curr_width;
+                                    screen_index += curr_width;
+                                    continue;
+                                }
+
+                                if RENDER_WHITESPACE && char == ' ' {
+                                    Editor::set_color(contents, Color::BrightBlack);
+                                    contents.push('∙');
+                                    Editor::set_color(contents, current_color);
+                                } else if RENDER_WHITESPACE && char == '\t' {
+                                    Editor::set_color(contents, Color::BrightBlack);
+                                    contents.push('⇀');
+                                    while zip.peek().is_some() && zip.peek().unwrap().1 == char_index {
+                                        zip.next();
+                                        contents.push(' ');
                                     }
-                                    contents.push(c);
+                                    Editor::set_color(contents, current_color);
+                                } else if render.is_control() {
+                                    Editor::invert_colors(contents);
+                                    contents.push(if char as u8 <= 26 {
+                                        (char as u8 | !0b10111111) as char
+                                    } else {
+                                        '?'
+                                    });
+                                    Editor::clear_formatting(contents);
+                                    Editor::set_color(contents, current_color);
                                 } else {
-                                    let color =
-                                        Editor::highlight_to_color(highlight);
-                                    if current_color != color {
-                                        Editor::set_color(contents, color);
-                                        current_color = color;
+                                    if let Highlight::Normal = highlight {
+                                        if current_color != Color::Default {
+                                            Editor::set_color(
+                                                contents,
+                                                Color::Default,
+                                            );
+                                            current_color = Color::Default;
+                                        }
+                                        contents.push(render);
+                                    } else {
+                                        let color =
+                                            Editor::highlight_to_color(highlight);
+                                        if current_color != color {
+                                            Editor::set_color(contents, color);
+                                            current_color = color;
+                                        }
+                                        contents.push(render);
                                     }
-                                    contents.push(c);
                                 }
                             }
+                            prev_width = curr_width;
+                            screen_index += curr_width;
+                        
+                        } else {
+                            break;
                         }
-                        prev_width = curr_width;
-                        i += curr_width;
                     }
                     Editor::set_color(contents, Color::Default);
                 }
