@@ -20,7 +20,7 @@ const VERSION: &str = "0.0.1";
 const TAB_STOP: usize = 8;
 const MAX_STATUS_FILENAME_LENGTH: usize = 20;
 const QUIT_TIMES: u8 = 3;
-const NON_PRINTING_CHARACTERS: bool = false;
+const RENDER_WHITESPACE: bool = false;
 
 // Create a way to read chars from stdin without blocking.
 fn spawn_stdin_channel() -> Receiver<char> {
@@ -335,16 +335,19 @@ impl Editor {
                 *row.highlight.last().unwrap_or(&Highlight::Normal);
             let next = chars.next();
             if let Some((i, (byte_index, c))) = next {
+                // No syntax highlighting.
                 if self.filetype.is_none() {
                     row.highlight.push(Highlight::Normal);
                     continue;
                 }
 
+                // Continuing a single-line comment.
                 if in_singleline_comment {
                     row.highlight.push(Highlight::Comment);
                     continue;
                 }
 
+                // Starting a single-line comment.
                 if !singleline_comment_start.is_empty()
                     && quote.is_none()
                     && !in_multiline_comment
@@ -356,6 +359,7 @@ impl Editor {
                     continue;
                 }
 
+                // Multi-line comments.
                 if !multiline_comment_start.is_empty() && quote.is_none() {
                     if in_multiline_comment {
                         if row.render[byte_index..]
@@ -384,6 +388,7 @@ impl Editor {
                     }
                 }
 
+                // Strings.
                 if self.filetype.unwrap().flags & HIGHLIGHT_STRINGS != 0 {
                     match quote {
                         Some(q) => {
@@ -420,6 +425,8 @@ impl Editor {
                         }
                     }
                 }
+
+                // Numbers.
                 if self.filetype.unwrap().flags & HIGHLIGHT_NUMBERS != 0
                     && ((c.is_digit(10)
                         && (prev_separator
@@ -431,6 +438,7 @@ impl Editor {
                     continue;
                 }
 
+                // Keywords.
                 if prev_separator {
                     let mut found_keyword = false;
                     'outer: for (keywords, highlight) in [
@@ -468,7 +476,10 @@ impl Editor {
                 break;
             }
         }
-
+        
+        // Check whether we need to update the syntax of following lines.
+        // eg. we could start a multiline comment on this line which could
+        // comment out the rest of the file.
         let changed = row.continue_multiline_string != quote
             || row.continue_multiline_comment != in_multiline_comment;
         row.continue_multiline_comment = in_multiline_comment;
@@ -491,25 +502,12 @@ impl Editor {
             if c == '\t' {
                 let mut tab_size = TAB_STOP - (render_length % TAB_STOP);
                 while tab_size > 0 {
-                    if !NON_PRINTING_CHARACTERS {
-                        row.render.push(' ');
-                    } else if tab_size == 1 {
-                        row.render.push('→');
-                    } else {
-                        row.render.push('—');
-                    }
+                    row.render.push(' ');
                     render_length += 1;
                     tab_size -= 1;
                 }
             } else if c.is_control() {
                 row.render.push(c);
-                render_length += 1;
-            } else if c == ' ' {
-                if NON_PRINTING_CHARACTERS {
-                    row.render.push('·');
-                } else {
-                    row.render.push(' ');
-                }
                 render_length += 1;
             } else {
                 row.render.push(c);
@@ -518,9 +516,6 @@ impl Editor {
                     render_length += 1;
                 }
             }
-        }
-        if NON_PRINTING_CHARACTERS {
-            row.render.push('↵');
         }
     }
 
@@ -1108,7 +1103,12 @@ impl Editor {
                                 continue;
                             }
 
-                            if c.is_control() {
+                            // TODO: Tabs look like spaces.
+                            if RENDER_WHITESPACE && c == ' ' {
+                                Editor::set_color(contents, Color::BrightBlack);
+                                contents.push('∙');
+                                Editor::set_color(contents, current_color);
+                            } else if c.is_control() {
                                 Editor::invert_colors(contents);
                                 contents.push(if c as u8 <= 26 {
                                     (c as u8 | !0b10111111) as char
