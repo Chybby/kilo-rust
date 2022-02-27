@@ -20,7 +20,7 @@ const VERSION: &str = "0.0.1";
 const TAB_STOP: usize = 8;
 const MAX_STATUS_FILENAME_LENGTH: usize = 20;
 const QUIT_TIMES: u8 = 3;
-const RENDER_WHITESPACE: bool = false;
+const RENDER_WHITESPACE: bool = true;
 
 // Create a way to read chars from stdin without blocking.
 fn spawn_stdin_channel() -> Receiver<char> {
@@ -63,6 +63,7 @@ struct Dimensions {
     cols: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq)]
 enum Color {
     Black,
@@ -870,11 +871,10 @@ impl Editor {
             return String::new();
         }
 
-        let regex: Regex;
-        match Regex::new(query) {
-            Ok(re) => regex = re,
+        let regex = match Regex::new(query) {
+            Ok(re) => re,
             _ => return ": Invalid regex".to_string(),
-        }
+        };
 
         match key {
             Key::Esc | Key::Enter => {
@@ -1162,25 +1162,23 @@ impl Editor {
                                     });
                                     Editor::clear_formatting(contents);
                                     Editor::set_color(contents, current_color);
-                                } else {
-                                    if let Highlight::Normal = highlight {
-                                        if current_color != Color::Default {
-                                            Editor::set_color(
-                                                contents,
-                                                Color::Default,
-                                            );
-                                            current_color = Color::Default;
-                                        }
-                                        contents.push(render);
-                                    } else {
-                                        let color =
-                                            Editor::highlight_to_color(highlight);
-                                        if current_color != color {
-                                            Editor::set_color(contents, color);
-                                            current_color = color;
-                                        }
-                                        contents.push(render);
+                                } else if let Highlight::Normal = highlight {
+                                    if current_color != Color::Default {
+                                        Editor::set_color(
+                                            contents,
+                                            Color::Default,
+                                        );
+                                        current_color = Color::Default;
                                     }
+                                    contents.push(render);
+                                } else {
+                                    let color =
+                                        Editor::highlight_to_color(highlight);
+                                    if current_color != color {
+                                        Editor::set_color(contents, color);
+                                        current_color = color;
+                                    }
+                                    contents.push(render);
                                 }
                             }
                             prev_width = curr_width;
