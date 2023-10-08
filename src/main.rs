@@ -1,6 +1,4 @@
-use nix::sys::termios::{
-    self, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios,
-};
+use nix::sys::termios::{self, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios};
 use regex::Regex;
 use std::cmp;
 use std::env;
@@ -20,7 +18,7 @@ const VERSION: &str = "0.0.1";
 const TAB_STOP: usize = 8;
 const MAX_STATUS_FILENAME_LENGTH: usize = 20;
 const QUIT_TIMES: u8 = 3;
-const RENDER_WHITESPACE: bool = true;
+const RENDER_WHITESPACE: bool = false;
 
 // Create a way to read chars from stdin without blocking.
 fn spawn_stdin_channel() -> Receiver<char> {
@@ -44,8 +42,8 @@ fn spawn_stdin_channel() -> Receiver<char> {
 
 fn get_window_size() -> Dimensions {
     // Interfacing with ioctl in Rust is a bit of a pain.
-    let (width, height) = term_size::dimensions_stdin()
-        .expect("Failed to get terminal dimensions.");
+    let (width, height) =
+        term_size::dimensions_stdin().expect("Failed to get terminal dimensions.");
     Dimensions {
         rows: height,
         cols: width,
@@ -148,13 +146,11 @@ const FILETYPES: [Filetype; 3] = [
         multiline_comment_start: "/*",
         multiline_comment_end: "*/",
         keywords1: &[
-            "switch", "if", "while", "for", "break", "continue", "return",
-            "else", "struct", "union", "typedef", "static", "enum", "class",
-            "case",
+            "switch", "if", "while", "for", "break", "continue", "return", "else", "struct",
+            "union", "typedef", "static", "enum", "class", "case",
         ],
         keywords2: &[
-            "int", "long", "double", "float", "char", "unsigned", "signed",
-            "void",
+            "int", "long", "double", "float", "char", "unsigned", "signed", "void",
         ],
         flags: HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
     },
@@ -165,9 +161,8 @@ const FILETYPES: [Filetype; 3] = [
         multiline_comment_start: "/*",
         multiline_comment_end: "*/",
         keywords1: &[
-            "if", "while", "for", "loop", "break", "continue", "return",
-            "else", "match", "mut", "fn", "move", "in", "as", "impl", "where",
-            "use",
+            "if", "while", "for", "loop", "break", "continue", "return", "else", "match", "mut",
+            "fn", "move", "in", "as", "impl", "where", "use",
         ],
         keywords2: &["let", "struct", "const", "enum"],
         flags: HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
@@ -179,8 +174,8 @@ const FILETYPES: [Filetype; 3] = [
         multiline_comment_start: "",
         multiline_comment_end: "",
         keywords1: &[
-            "import", "from", "yield", "return", "if", "elif", "else", "while",
-            "for", "in", "is", "not", "and", "or",
+            "import", "from", "yield", "return", "if", "elif", "else", "while", "for", "in", "is",
+            "not", "and", "or",
         ],
         keywords2: &[
             "def",
@@ -225,15 +220,30 @@ impl Row {
             if c == '\t' {
                 let mut tab_size = TAB_STOP - (render_length % TAB_STOP);
                 while tab_size > 0 {
-                    result.push((c, i, render_iter.next().unwrap(), *highlight_iter.next().unwrap()));
+                    result.push((
+                        c,
+                        i,
+                        render_iter.next().unwrap(),
+                        *highlight_iter.next().unwrap(),
+                    ));
                     render_length += 1;
                     tab_size -= 1;
                 }
             } else if c.is_control() {
-                result.push((c, i, render_iter.next().unwrap(), *highlight_iter.next().unwrap()));
+                result.push((
+                    c,
+                    i,
+                    render_iter.next().unwrap(),
+                    *highlight_iter.next().unwrap(),
+                ));
                 render_length += 1;
             } else {
-                result.push((c, i, render_iter.next().unwrap(), *highlight_iter.next().unwrap()));
+                result.push((
+                    c,
+                    i,
+                    render_iter.next().unwrap(),
+                    *highlight_iter.next().unwrap(),
+                ));
                 render_length += 1;
                 for _ in 0..UnicodeWidthChar::width(c).unwrap_or(1) - 1 {
                     render_length += 1;
@@ -290,9 +300,7 @@ impl Editor {
         match highlight {
             Highlight::Number => Color::Magenta,
             Highlight::String => Color::Yellow,
-            Highlight::Comment | Highlight::MultilineComment => {
-                Color::BrightBlack
-            }
+            Highlight::Comment | Highlight::MultilineComment => Color::BrightBlack,
             Highlight::Keyword1 => Color::Red,
             Highlight::Keyword2 => Color::Cyan,
             Highlight::Match => Color::Blue,
@@ -306,8 +314,7 @@ impl Editor {
                 for filetype in &FILETYPES {
                     for pattern in filetype.filename_patterns {
                         if (pattern.starts_with('.') && name.ends_with(pattern))
-                            || (!pattern.starts_with('.')
-                                && name.contains(pattern))
+                            || (!pattern.starts_with('.') && name.contains(pattern))
                         {
                             self.filetype = Some(filetype);
                             for y in 0..self.rows.len() {
@@ -353,8 +360,7 @@ impl Editor {
 
         let mut prev_separator = true;
         let mut in_singleline_comment = false;
-        let mut in_multiline_comment =
-            y != 0 && first[first.len() - 1].continue_multiline_comment;
+        let mut in_multiline_comment = y != 0 && first[first.len() - 1].continue_multiline_comment;
 
         let mut quote = if y == 0 || in_multiline_comment {
             None
@@ -363,8 +369,7 @@ impl Editor {
         };
 
         loop {
-            let prev_highlight =
-                *row.highlight.last().unwrap_or(&Highlight::Normal);
+            let prev_highlight = *row.highlight.last().unwrap_or(&Highlight::Normal);
             let next = chars.next();
             if let Some((i, (byte_index, c))) = next {
                 // No syntax highlighting.
@@ -383,8 +388,7 @@ impl Editor {
                 if !singleline_comment_start.is_empty()
                     && quote.is_none()
                     && !in_multiline_comment
-                    && row.render[byte_index..]
-                        .starts_with(singleline_comment_start)
+                    && row.render[byte_index..].starts_with(singleline_comment_start)
                 {
                     in_singleline_comment = true;
                     row.highlight.push(Highlight::Comment);
@@ -394,9 +398,7 @@ impl Editor {
                 // Multi-line comments.
                 if !multiline_comment_start.is_empty() && quote.is_none() {
                     if in_multiline_comment {
-                        if row.render[byte_index..]
-                            .starts_with(multiline_comment_end)
-                        {
+                        if row.render[byte_index..].starts_with(multiline_comment_end) {
                             row.highlight.push(Highlight::MultilineComment);
                             for _ in 0..multiline_comment_end.len() - 1 {
                                 chars.next();
@@ -407,9 +409,7 @@ impl Editor {
                             row.highlight.push(Highlight::MultilineComment);
                         }
                         continue;
-                    } else if row.render[byte_index..]
-                        .starts_with(multiline_comment_start)
-                    {
+                    } else if row.render[byte_index..].starts_with(multiline_comment_start) {
                         row.highlight.push(Highlight::MultilineComment);
                         for _ in 0..multiline_comment_start.len() - 1 {
                             chars.next();
@@ -460,9 +460,7 @@ impl Editor {
 
                 // Numbers.
                 if self.filetype.unwrap().flags & HIGHLIGHT_NUMBERS != 0
-                    && ((c.is_digit(10)
-                        && (prev_separator
-                            || prev_highlight == Highlight::Number))
+                    && ((c.is_digit(10) && (prev_separator || prev_highlight == Highlight::Number))
                         || (c == '.' && prev_highlight == Highlight::Number))
                 {
                     row.highlight.push(Highlight::Number);
@@ -508,7 +506,7 @@ impl Editor {
                 break;
             }
         }
-        
+
         // Check whether we need to update the syntax of following lines.
         // eg. we could start a multiline comment on this line which could
         // comment out the rest of the file.
@@ -659,10 +657,7 @@ impl Editor {
         self.get_screen_index(self.cursor_position.x, self.cursor_position.y)
     }
 
-    fn screen_index_to_char_index(
-        screen_index: usize,
-        row: Option<&Row>,
-    ) -> usize {
+    fn screen_index_to_char_index(screen_index: usize, row: Option<&Row>) -> usize {
         if row.is_none() || screen_index == 0 {
             return 0;
         }
@@ -721,11 +716,7 @@ impl Editor {
             self.insert_row(self.rows.len(), "");
         }
 
-        self.insert_char_in_row(
-            self.cursor_position.y,
-            self.cursor_position.x,
-            c,
-        );
+        self.insert_char_in_row(self.cursor_position.y, self.cursor_position.x, c);
         self.cursor_position.x += 1;
         self.dirty = true;
     }
@@ -739,15 +730,11 @@ impl Editor {
         }
 
         if self.cursor_position.x > 0 {
-            self.delete_char_in_row(
-                self.cursor_position.y,
-                self.cursor_position.x - 1,
-            );
+            self.delete_char_in_row(self.cursor_position.y, self.cursor_position.x - 1);
             self.cursor_position.x -= 1;
             self.dirty = true;
         } else {
-            self.cursor_position.x =
-                self.rows[self.cursor_position.y - 1].chars.chars().count();
+            self.cursor_position.x = self.rows[self.cursor_position.y - 1].chars.chars().count();
             let chars = mem::take(&mut self.rows[self.cursor_position.y].chars);
             self.append_string_to_row(self.cursor_position.y - 1, &chars);
             self.delete_row(self.cursor_position.y);
@@ -824,8 +811,7 @@ impl Editor {
 
     fn save(&mut self) {
         if self.filename.is_none() {
-            self.filename = self
-                .prompt("Save as: {} (ESC to cancel)", |_, _, _| String::new());
+            self.filename = self.prompt("Save as: {} (ESC to cancel)", |_, _, _| String::new());
             if self.filename.is_none() {
                 self.set_status_message("Save aborted");
                 return;
@@ -838,20 +824,14 @@ impl Editor {
                 let file_contents = self.rows_to_string();
                 match file.write_all(file_contents.as_bytes()) {
                     Ok(_) => {
-                        self.set_status_message(&format!(
-                            "{} bytes written",
-                            file_contents.len()
-                        ));
+                        self.set_status_message(&format!("{} bytes written", file_contents.len()));
                         self.dirty = false;
                     }
                     // An error here means the file contents are lost. Oh well.
-                    Err(error) => self
-                        .set_status_message(&format!("Save failed: {}", error)),
+                    Err(error) => self.set_status_message(&format!("Save failed: {}", error)),
                 }
             }
-            Err(error) => {
-                self.set_status_message(&format!("Save failed: {:?}", error))
-            }
+            Err(error) => self.set_status_message(&format!("Save failed: {:?}", error)),
         }
     }
 
@@ -890,8 +870,7 @@ impl Editor {
                 };
             }
             Key::Arrow(Arrow::Right) | Key::Arrow(Arrow::Down) => {
-                self.match_index = if self.match_index == self.matches.len() - 1
-                {
+                self.match_index = if self.match_index == self.matches.len() - 1 {
                     0
                 } else {
                     self.match_index + 1
@@ -978,11 +957,7 @@ impl Editor {
 
     fn draw_cursor(contents: &mut String, cursor_position: &Position) {
         // Move the displayed cursor to a certain position.
-        let s = format!(
-            "\x1b[{};{}H",
-            cursor_position.y + 1,
-            cursor_position.x + 1
-        );
+        let s = format!("\x1b[{};{}H", cursor_position.y + 1, cursor_position.x + 1);
         contents.push_str(&s);
     }
 
@@ -1038,17 +1013,12 @@ impl Editor {
             let mut filled_line = false;
             let file_row = y + self.text_offset.y;
             if file_row >= self.rows.len() {
-                if self.rows.is_empty() && y == self.screen_dimensions.rows / 3
-                {
-                    let welcome_message =
-                        format!("Kilo editor -- version {}", VERSION);
-                    let message_length = cmp::min(
-                        welcome_message.len(),
-                        self.screen_dimensions.cols - 1,
-                    );
+                if self.rows.is_empty() && y == self.screen_dimensions.rows / 3 {
+                    let welcome_message = format!("Kilo editor -- version {}", VERSION);
+                    let message_length =
+                        cmp::min(welcome_message.len(), self.screen_dimensions.cols - 1);
 
-                    let mut padding =
-                        (self.screen_dimensions.cols - message_length) / 2;
+                    let mut padding = (self.screen_dimensions.cols - message_length) / 2;
                     if padding > 0 {
                         Editor::set_color(contents, Color::Blue);
                         contents.push('~');
@@ -1090,12 +1060,8 @@ impl Editor {
                 if self.text_offset.x < line_length {
                     let mut displayed_length = line_length - self.text_offset.x;
                     // Cap the displayed length to the length of the screen.
-                    if displayed_length
-                        >= self.screen_dimensions.cols
-                            - (line_number_padding + 1)
-                    {
-                        displayed_length = self.screen_dimensions.cols
-                            - (line_number_padding + 1);
+                    if displayed_length >= self.screen_dimensions.cols - (line_number_padding + 1) {
+                        displayed_length = self.screen_dimensions.cols - (line_number_padding + 1);
                         filled_line = true;
                     }
                     // Start displaying the line at the text offset.
@@ -1128,8 +1094,7 @@ impl Editor {
                                     contents.push('<');
                                     Editor::set_color(contents, current_color);
                                 } else if curr_width > 1
-                                    && screen_index + curr_width
-                                        > start_index + displayed_length
+                                    && screen_index + curr_width > start_index + displayed_length
                                 {
                                     // There's a cut off wide character at the end
                                     // of the row.
@@ -1148,7 +1113,9 @@ impl Editor {
                                 } else if RENDER_WHITESPACE && char == '\t' {
                                     Editor::set_color(contents, Color::BrightBlack);
                                     contents.push('⇀');
-                                    while zip.peek().is_some() && zip.peek().unwrap().1 == char_index {
+                                    while zip.peek().is_some()
+                                        && zip.peek().unwrap().1 == char_index
+                                    {
                                         zip.next();
                                         contents.push(' ');
                                     }
@@ -1164,16 +1131,12 @@ impl Editor {
                                     Editor::set_color(contents, current_color);
                                 } else if let Highlight::Normal = highlight {
                                     if current_color != Color::Default {
-                                        Editor::set_color(
-                                            contents,
-                                            Color::Default,
-                                        );
+                                        Editor::set_color(contents, Color::Default);
                                         current_color = Color::Default;
                                     }
                                     contents.push(render);
                                 } else {
-                                    let color =
-                                        Editor::highlight_to_color(highlight);
+                                    let color = Editor::highlight_to_color(highlight);
                                     if current_color != color {
                                         Editor::set_color(contents, color);
                                         current_color = color;
@@ -1183,7 +1146,6 @@ impl Editor {
                             }
                             prev_width = curr_width;
                             screen_index += curr_width;
-                        
                         } else {
                             break;
                         }
@@ -1252,16 +1214,13 @@ impl Editor {
 
     fn draw_message_bar(&self, contents: &mut String) {
         Editor::clear_row(contents);
-        let message = if self.status_message.len() > self.screen_dimensions.cols
-        {
+        let message = if self.status_message.len() > self.screen_dimensions.cols {
             &self.status_message[0..self.screen_dimensions.cols]
         } else {
             &self.status_message
         };
 
-        if !message.is_empty()
-            && self.status_message_time.elapsed().as_secs() < 5
-        {
+        if !message.is_empty() && self.status_message_time.elapsed().as_secs() < 5 {
             contents.push_str(message);
         }
     }
@@ -1286,8 +1245,7 @@ impl Editor {
         let line_number_space = format!("{}", self.rows.len()).len() + 1;
 
         let cursor_screen_position = Position {
-            x: self.get_current_screen_index() - self.text_offset.x
-                + line_number_space,
+            x: self.get_current_screen_index() - self.text_offset.x + line_number_space,
             y: self.cursor_position.y - self.text_offset.y,
         };
         Editor::draw_cursor(&mut contents, &cursor_screen_position);
@@ -1317,11 +1275,7 @@ impl Editor {
         let mut input = String::new();
         let mut message = String::new();
         loop {
-            self.set_status_message(&format!(
-                "{} {}",
-                prompt.replace("{}", &input),
-                &message
-            ));
+            self.set_status_message(&format!("{} {}", prompt.replace("{}", &input), &message));
             self.refresh_screen();
 
             let key = self.read_key();
@@ -1426,10 +1380,8 @@ impl Editor {
                 if self.cursor_position.y > 0 {
                     let screen_index = self.get_current_screen_index();
                     self.cursor_position.y -= 1;
-                    self.cursor_position.x = Editor::screen_index_to_char_index(
-                        screen_index,
-                        self.get_current_row(),
-                    );
+                    self.cursor_position.x =
+                        Editor::screen_index_to_char_index(screen_index, self.get_current_row());
                 }
             }
             Arrow::Left => {
@@ -1437,18 +1389,15 @@ impl Editor {
                     self.cursor_position.x -= 1
                 } else if self.cursor_position.y > 0 {
                     self.cursor_position.y -= 1;
-                    self.cursor_position.x =
-                        self.get_current_row().unwrap().chars.chars().count();
+                    self.cursor_position.x = self.get_current_row().unwrap().chars.chars().count();
                 }
             }
             Arrow::Down => {
                 if self.cursor_position.y < self.rows.len() {
                     let screen_index = self.get_current_screen_index();
                     self.cursor_position.y += 1;
-                    self.cursor_position.x = Editor::screen_index_to_char_index(
-                        screen_index,
-                        self.get_current_row(),
-                    );
+                    self.cursor_position.x =
+                        Editor::screen_index_to_char_index(screen_index, self.get_current_row());
                 }
             }
             Arrow::Right => {
@@ -1456,9 +1405,7 @@ impl Editor {
                     #[allow(clippy::comparison_chain)]
                     if self.cursor_position.x < row.chars.chars().count() {
                         self.cursor_position.x += 1
-                    } else if self.cursor_position.x
-                        == row.chars.chars().count()
-                    {
+                    } else if self.cursor_position.x == row.chars.chars().count() {
                         self.cursor_position.y += 1;
                         self.cursor_position.x = 0;
                     }
@@ -1487,11 +1434,8 @@ impl Editor {
             self.text_offset.y = self.cursor_position.y;
         }
 
-        if self.cursor_position.y
-            >= self.text_offset.y + self.screen_dimensions.rows
-        {
-            self.text_offset.y =
-                self.cursor_position.y - self.screen_dimensions.rows + 1;
+        if self.cursor_position.y >= self.text_offset.y + self.screen_dimensions.rows {
+            self.text_offset.y = self.cursor_position.y - self.screen_dimensions.rows + 1;
         }
 
         if screen_x < self.text_offset.x {
@@ -1538,9 +1482,8 @@ impl Editor {
                 match key {
                     Key::PageUp => self.cursor_position.y = self.text_offset.y,
                     Key::PageDown => {
-                        self.cursor_position.y = self.text_offset.y
-                            + self.screen_dimensions.rows
-                            - 1;
+                        self.cursor_position.y =
+                            self.text_offset.y + self.screen_dimensions.rows - 1;
                         if self.cursor_position.y > self.rows.len() {
                             self.cursor_position.y = self.rows.len();
                         }
@@ -1601,8 +1544,7 @@ impl Editor {
 
 fn enable_raw_mode() -> Termios {
     let stdin_raw_fd = io::stdin().as_raw_fd();
-    let orig_termios =
-        termios::tcgetattr(stdin_raw_fd).expect("Error in tcgetattr");
+    let orig_termios = termios::tcgetattr(stdin_raw_fd).expect("Error in tcgetattr");
 
     let mut termios = orig_termios.clone();
     termios.input_flags &= !(InputFlags::BRKINT
@@ -1612,23 +1554,19 @@ fn enable_raw_mode() -> Termios {
         | InputFlags::IXON);
     termios.output_flags &= !(OutputFlags::OPOST);
     termios.control_flags |= ControlFlags::CS8;
-    termios.local_flags &= !(LocalFlags::ECHO
-        | LocalFlags::ICANON
-        | LocalFlags::IEXTEN
-        | LocalFlags::ISIG);
+    termios.local_flags &=
+        !(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::IEXTEN | LocalFlags::ISIG);
     // Rust always blocks when reading from stdin.
     // termios.c_cc[VMIN] = 0;
     // termios.c_cc[VTIME] = 1;
-    termios::tcsetattr(stdin_raw_fd, SetArg::TCSAFLUSH, &termios)
-        .expect("Error in tcsetattr");
+    termios::tcsetattr(stdin_raw_fd, SetArg::TCSAFLUSH, &termios).expect("Error in tcsetattr");
 
     orig_termios
 }
 
 fn disable_raw_mode(orig_termios: &mut Termios) {
     let stdin_raw_fd = io::stdin().as_raw_fd();
-    termios::tcsetattr(stdin_raw_fd, SetArg::TCSAFLUSH, orig_termios)
-        .expect("Error in tcsetattr");
+    termios::tcsetattr(stdin_raw_fd, SetArg::TCSAFLUSH, orig_termios).expect("Error in tcsetattr");
 }
 
 struct TerminalRestorer {
@@ -1655,9 +1593,7 @@ fn main() {
         editor.open(&args.nth(1).unwrap());
     }
 
-    editor.set_status_message(
-        "HELP: Ctrl-S = Save | Ctrl-F = Find | Ctrl-Q = Quit",
-    );
+    editor.set_status_message("HELP: Ctrl-S = Save | Ctrl-F = Find | Ctrl-Q = Quit");
 
     editor.render_loop();
 }
