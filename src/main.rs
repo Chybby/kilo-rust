@@ -5,7 +5,7 @@ use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::mem;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::prelude::AsFd;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -41,7 +41,7 @@ fn spawn_stdin_channel() -> Receiver<char> {
 }
 
 fn get_window_size() -> Dimensions {
-    // Interfacing with ioctl in Rust is a bit of a pain.
+    // Interfacing with ioctl in Rust is a bit of a pain so we use a library.
     let (width, height) =
         term_size::dimensions_stdin().expect("Failed to get terminal dimensions.");
     Dimensions {
@@ -1543,8 +1543,8 @@ impl Editor {
 /*** init ***/
 
 fn enable_raw_mode() -> Termios {
-    let stdin_raw_fd = io::stdin().as_raw_fd();
-    let orig_termios = termios::tcgetattr(stdin_raw_fd).expect("Error in tcgetattr");
+    let stdin = io::stdin();
+    let orig_termios = termios::tcgetattr(stdin.as_fd()).expect("Error in tcgetattr");
 
     let mut termios = orig_termios.clone();
     termios.input_flags &= !(InputFlags::BRKINT
@@ -1559,14 +1559,13 @@ fn enable_raw_mode() -> Termios {
     // Rust always blocks when reading from stdin.
     // termios.c_cc[VMIN] = 0;
     // termios.c_cc[VTIME] = 1;
-    termios::tcsetattr(stdin_raw_fd, SetArg::TCSAFLUSH, &termios).expect("Error in tcsetattr");
+    termios::tcsetattr(stdin.as_fd(), SetArg::TCSAFLUSH, &termios).expect("Error in tcsetattr");
 
     orig_termios
 }
 
 fn disable_raw_mode(orig_termios: &mut Termios) {
-    let stdin_raw_fd = io::stdin().as_raw_fd();
-    termios::tcsetattr(stdin_raw_fd, SetArg::TCSAFLUSH, orig_termios).expect("Error in tcsetattr");
+    termios::tcsetattr(io::stdin(), SetArg::TCSAFLUSH, orig_termios).expect("Error in tcsetattr");
 }
 
 struct TerminalRestorer {
